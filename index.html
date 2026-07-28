@@ -353,7 +353,7 @@ async function signIn() {
       const result = await msalInstance.loginPopup(loginRequest);
       await onSignedIn(result.account);
     } catch(popupErr) {
-      if (popupErr.errorCode === 'popup_window_error' || popupErr.errorCode === 'empty_window_error') {
+      if (popupErr.errorCode === 'popup_window_error' || popupErr.errorCode === 'empty_window_error' || popupErr.errorCode === 'block_nested_popups') {
         await msalInstance.loginRedirect(loginRequest);
       } else { throw popupErr; }
     }
