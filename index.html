@@ -304,6 +304,17 @@ const msalConfig = {
   cache: { cacheLocation:'sessionStorage', storeAuthStateInCookie:true }
 };
 const loginRequest = { scopes:['Sites.ReadWrite.All','User.Read'] };
+// Reset stale MSAL popup identity. MSAL blocks all interactive sign-in
+// (error: block_nested_popups) if it thinks this window is a popup it opened.
+// It decides that by checking whether window.name starts with "msal." -- and
+// window.name survives navigation and browser session restore, so a leftover
+// popup name blocks sign-in permanently until it is cleared.
+try {
+  if (typeof window.name === 'string' && window.name.indexOf('msal.') === 0) {
+    window.name = '';
+  }
+} catch (e) { /* ignore */ }
+
 const msalInstance = new msal.PublicClientApplication(msalConfig);
 
 let skus=[], orders=[], forecast=[], importLog=[], ordersPage=0, siteId=null;
@@ -347,24 +358,21 @@ async function init() {
   }
 }
 
+// Redirect-only sign-in. Popup sign-in was removed: because redirectUri points
+// at this app, the popup loaded the whole app and left behind a window MSAL
+// permanently refused to authenticate in.
 async function signIn() {
   try {
-    try {
-      const result = await msalInstance.loginPopup(loginRequest);
-      await onSignedIn(result.account);
-    } catch(popupErr) {
-      if (popupErr.errorCode === 'popup_window_error' || popupErr.errorCode === 'empty_window_error' || popupErr.errorCode === 'block_nested_popups') {
-        await msalInstance.loginRedirect(loginRequest);
-      } else { throw popupErr; }
-    }
+    await msalInstance.loginRedirect(loginRequest);
   } catch(e) { showLoginError('Sign in failed: ' + e.message); }
 }
 
 async function signOut() {
   const accounts = msalInstance.getAllAccounts();
   if (accounts.length > 0) {
-    try { await msalInstance.logoutPopup({account:accounts[0]}); }
-    catch(e) { await msalInstance.logoutRedirect({account:accounts[0]}); }
+    // Redirect-only, same reason as signIn(): the logout popup also lands on
+    // this app's URL and can leave behind a blocked window.
+    await msalInstance.logoutRedirect({account:accounts[0]});
   }
 }
 
@@ -375,8 +383,12 @@ async function getToken() {
     const r = await msalInstance.acquireTokenSilent({...loginRequest, account:accounts[0]});
     return r.accessToken;
   } catch(e) {
-    const r = await msalInstance.acquireTokenPopup({...loginRequest, account:accounts[0]});
-    return r.accessToken;
+    // Silent refresh failed -- send the user through a full-page redirect
+    // instead of a popup. The page navigates away, so nothing after this runs;
+    // the throw just stops callers from using an undefined token in the
+    // moment before navigation happens.
+    await msalInstance.acquireTokenRedirect({...loginRequest, account:accounts[0]});
+    throw new Error('Redirecting to sign in...');
   }
 }
 
