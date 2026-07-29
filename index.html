@@ -67,6 +67,9 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
 .toast-wrap{position:fixed;bottom:20px;right:20px;z-index:2000;display:flex;flex-direction:column;gap:6px}
 .toast{padding:10px 14px;border-radius:7px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,0.15);max-width:300px;animation:slideUp 0.2s ease;color:#fff;background:var(--text)}
 .toast.ok{background:var(--ok)}.toast.err{background:var(--danger)}.toast.warn{background:var(--warn)}
+.po-ovr{width:76px;padding:4px 6px;font-size:12px;text-align:right;border:1px solid var(--border);border-radius:5px;background:var(--surface);color:var(--text)}
+.po-ovr::placeholder{color:var(--text-3);font-weight:400}
+.po-ovr.set{border-color:var(--warn);background:var(--warn-light);color:var(--warn);font-weight:700}
 @keyframes slideUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 .two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .login-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:60vh;text-align:center;padding:40px}
@@ -141,6 +144,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
     </div>
     <div class="flex">
       <button onclick="recalcAll();renderForecastTable();renderDashboard();showToast('Recalculated','ok')">&#8635; Recalculate</button>
+      <span id="ovr-count" class="badge badge-warn hidden" style="align-self:center"></span>
+      <button onclick="clearPOOverrides()">Clear Overrides</button>
       <button class="btn-primary" onclick="exportForecast()">&#8595; Export to Excel</button>
       <button class="btn-primary" onclick="exportPO()">&#8595; PO Export</button>
     </div>
@@ -161,6 +166,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
           <th onclick="sortForecast('minShelf')" style="cursor:pointer"><span id="fsh-minShelf">Min Shelf</span></th>
           <th onclick="sortForecast('daysLeft')" style="cursor:pointer"><span id="fsh-daysLeft">Days Left &#9650;</span></th>
           <th onclick="sortForecast('orderQty')" style="cursor:pointer"><span id="fsh-orderQty">Order Qty</span></th>
+          <th title="Enter a quantity here to override the forecast on the PO export. Leave blank to use the forecast."><span>PO Override</span></th>
           <th onclick="sortForecast('status')" style="cursor:pointer"><span id="fsh-status">Status</span></th>
           <th></th>
         </tr></thead>
@@ -319,6 +325,10 @@ try {
 const msalInstance = new msal.PublicClientApplication(msalConfig);
 
 let skus=[], orders=[], forecast=[], importLog=[], ordersPage=0, siteId=null;
+// PO quantity overrides, keyed by SKU code. Deliberately in-memory only: an
+// override is for the order you are placing right now, and a forgotten one
+// sitting in storage next week would silently distort a purchase order.
+let poOverrides={};
 let ordersSort={col:'date',dir:'desc'};
 let forecastSort={col:'daysLeft',dir:'asc'};
 const PAGE_SIZE=100;
@@ -927,9 +937,11 @@ function renderForecastTable(){
     <td>${f.sku.minShelf.toLocaleString()}</td>
     <td><span class="badge ${f.daysLeft<=f.sku.lead?'badge-danger':f.daysLeft<=21?'badge-warn':'badge-ok'}">${f.daysLeft>=999?'>365':f.daysLeft+'d'}</span></td>
     <td style="font-weight:700;color:${f.orderQty>0?'var(--brand)':'var(--text-3)'}">${f.orderQty>0?f.orderQty.toLocaleString():'--'}</td>
+    <td><input type="number" min="0" step="1" class="po-ovr${poOverrides[f.sku.code]!==undefined?' set':''}" value="${poOverrides[f.sku.code]!==undefined?poOverrides[f.sku.code]:''}" placeholder="${f.orderQty>0?f.orderQty:'--'}" onchange="setPOOverride('${f.sku.code}',this.value)"></td>
     <td>${f.status==='critical'?'<span class="badge badge-danger">Order now</span>':f.status==='warn'?'<span class="badge badge-warn">Reorder soon</span>':'<span class="badge badge-ok">Healthy</span>'}</td>
     <td><button class="btn-sm" onclick="openSKUModal('${f.sku.code}')">Settings</button></td>
-  </tr>`).join('')||'<tr><td colspan="15" class="text-muted" style="padding:20px;text-align:center">No results</td></tr>';
+  </tr>`).join('')||'<tr><td colspan="17" class="text-muted" style="padding:20px;text-align:center">No results</td></tr>';
+  updateOverrideBadge();
 }
 
 // ============================================================
@@ -1208,6 +1220,47 @@ function exportForecast(){
 }
 
 // ------------------------------------------------------------
+// PO QUANTITY OVERRIDES
+// ------------------------------------------------------------
+function setPOOverride(code,val){
+  const v=String(val==null?'':val).trim();
+  if(v===''){
+    delete poOverrides[code];
+  } else {
+    const n=parseInt(v,10);
+    if(isNaN(n)||n<0){
+      delete poOverrides[code];
+      showToast('Override must be 0 or a positive whole number','err');
+    } else {
+      poOverrides[code]=n;
+    }
+  }
+  renderForecastTable();
+}
+
+function clearPOOverrides(){
+  const n=Object.keys(poOverrides).length;
+  if(!n){ showToast('No overrides to clear','ok'); return; }
+  poOverrides={};
+  renderForecastTable();
+  showToast(n+' override'+(n===1?'':'s')+' cleared','ok');
+}
+
+// The quantity that should actually go on the purchase order.
+function poQty(f){
+  const o=poOverrides[f.sku.code];
+  return o!==undefined?o:f.orderQty;
+}
+
+function updateOverrideBadge(){
+  const el=document.getElementById('ovr-count');
+  if(!el)return;
+  const n=Object.keys(poOverrides).length;
+  el.textContent=n+' override'+(n===1?'':'s');
+  el.classList.toggle('hidden',n===0);
+}
+
+// ------------------------------------------------------------
 // SELLERCLOUD PO EXPORT
 // Matches the SellerCloud purchase-order upload template exactly:
 //   ProductID | VendorSKU | UnitPrice | Qty | Discount | DiscountType
@@ -1220,17 +1273,18 @@ function vendorSku(code){
 
 function exportPO(){
   const items=forecast
-    .filter(f=>f.orderQty>0)
+    .filter(f=>poQty(f)>0)
     .sort((a,b)=>String(a.sku.code).localeCompare(String(b.sku.code)));
 
   if(!items.length){ showToast('Nothing to order -- no SKUs with an order quantity','err'); return; }
 
   const rows=[['ProductID','VendorSKU','UnitPrice','Qty','Discount','DiscountType']];
-  let noCost=0;
+  let noCost=0, overridden=0;
   items.forEach(f=>{
     const price=Math.round((f.sku.cost||0)*100)/100;
     if(!price) noCost++;
-    rows.push([f.sku.code, vendorSku(f.sku.code), price, f.orderQty, '', '']);
+    if(poOverrides[f.sku.code]!==undefined) overridden++;
+    rows.push([f.sku.code, vendorSku(f.sku.code), price, poQty(f), '', '']);
   });
 
   const ws=XLSX.utils.aoa_to_sheet(rows);
@@ -1240,8 +1294,10 @@ function exportPO(){
   XLSX.utils.book_append_sheet(wb,ws,'Sheet1');
   XLSX.writeFile(wb,'SellerCloud_PO_'+new Date().toISOString().substring(0,10)+'.xlsx');
 
-  if(noCost) showToast(items.length+' lines exported -- '+noCost+' have no unit cost','warn');
-  else showToast(items.length+' lines exported for SellerCloud','ok');
+  const notes=[];
+  if(overridden) notes.push(overridden+' overridden');
+  if(noCost) notes.push(noCost+' with no unit cost');
+  showToast(items.length+' lines exported'+(notes.length?' -- '+notes.join(', '):' for SellerCloud'), noCost?'warn':'ok');
 }
 
 // ============================================================
