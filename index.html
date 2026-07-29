@@ -519,12 +519,14 @@ function perfReport(){
     const rows = d.pages.reduce((a,b)=>a+b,0);
     const sizes = [...new Set(d.pages)].sort((a,b)=>b-a);
     L.push('  ' + name);
+    L.push('    query               ' + (d.trimmed?'trimmed ($select)':'full fields').padStart(9));
     L.push('    rows returned       ' + String(rows).padStart(9));
     L.push('    pages (requests)    ' + String(d.pages.length).padStart(9));
     L.push('    rows per page       ' + String(d.pages[0]||0).padStart(9) + '   <-- ACTUAL page size cap');
     if (sizes.length > 2) L.push('    page sizes seen     ' + sizes.slice(0,5).join(', '));
     L.push('    time                ' + perfFmt(d.ms).padStart(9));
     L.push('    payload             ' + perfBytes(d.chars).padStart(9));
+    L.push('    bytes per row       ' + String(rows?Math.round(d.chars/rows):0).padStart(9) + '   <-- KEY METRIC');
     if (d.pages.length > 1) L.push('    avg per page        ' + perfFmt(d.ms/d.pages.length).padStart(9));
   });
   if (perf.slowest.length){
@@ -602,31 +604,71 @@ async function lid(name) {
 }
 
 async function getListItems(listName, select, filter, orderby, top=5000) {
-  const id = await lid(listName);
-  let url = `${GRAPH_BASE}/sites/${siteId}/lists/${id}/items?expand=fields&$top=${top}`;
-  if (select) url += `&$select=fields($select=${select})`;
-  if (filter) url += `&$filter=${filter}`;
-  if (orderby) url += `&$orderby=${orderby}`;
-  // --- diagnostics ---
-  const _stat = perf.lists[listName] = {pages:[], ms:0, chars:0, requested:top};
-  const _t0 = performance.now();
-  const _c0 = perf.chars;
-  // --- end diagnostics ---
-  const out = [];
-  while (url) {
-    const d = await graphReq('GET', url);
-    const batch = (d.value||[]);
-    _stat.pages.push(batch.length);
-    out.push(...batch.map(i=>i.fields||i));
-    url = d['@odata.nextLink'] || null;
-    // Keep the badge alive so a long load does not look frozen.
-    if (_stat.pages.length % 25 === 0) {
-      setBadge('loading', `Loading ${listName}... ${out.length.toLocaleString()} rows`);
+  const listId = await lid(listName);
+  const base = `${GRAPH_BASE}/sites/${siteId}/lists/${listId}/items`;
+
+  // Two query shapes. "trimmed" asks only for the fields the app uses and
+  // drops item-level metadata (webUrl, eTag, parentReference, contentType and
+  // the full createdBy/lastModifiedBy user objects). "full" is byte-identical
+  // to the query this app has always used, kept as a runtime fallback.
+  const buildUrl = (trimmed) => {
+    const p = [];
+    if (trimmed) {
+      p.push('$select=id,fields');
+      p.push(`expand=fields(select=${select})`);
+    } else {
+      p.push('expand=fields');
     }
+    p.push(`$top=${top}`);
+    if (filter)  p.push(`$filter=${filter}`);
+    if (orderby) p.push(`$orderby=${orderby}`);
+    return base + '?' + p.join('&');
+  };
+
+  const run = async (trimmed) => {
+    const stat = perf.lists[listName] = {pages:[], ms:0, chars:0, trimmed};
+    const t0 = performance.now(), c0 = perf.chars;
+    const out = [];
+    let url = buildUrl(trimmed), firstPage = true;
+    while (url) {
+      let d;
+      try {
+        d = await graphReq('GET', url);
+      } catch(e) {
+        // Only a failure on the very first page suggests the query shape was
+        // rejected. A later failure is a genuine error and must not be masked.
+        if (firstPage && trimmed) { e._trimRejected = true; }
+        throw e;
+      }
+      firstPage = false;
+      const batch = d.value || [];
+      stat.pages.push(batch.length);
+      for (const it of batch) {
+        const f = it.fields || it;
+        // With $select the item id lives at item level, not inside fields.
+        // toggleExclude() patches by this id, so carry it across explicitly.
+        if (f.id === undefined && it.id !== undefined) f.id = it.id;
+        out.push(f);
+      }
+      url = d['@odata.nextLink'] || null;
+      if (stat.pages.length % 5 === 0) {
+        setBadge('loading', `Loading ${listName}... ${out.length.toLocaleString()} rows`);
+      }
+    }
+    stat.ms = performance.now() - t0;
+    stat.chars = perf.chars - c0;
+    return out;
+  };
+
+  if (!select) return run(false);
+  try {
+    return await run(true);
+  } catch(e) {
+    if (!e._trimRejected) throw e;
+    console.warn(`Trimmed query rejected for ${listName}; retrying with full fields.`, e.message);
+    showToast('Field-trimmed query rejected -- using full query for '+listName, 'warn');
+    return run(false);
   }
-  _stat.ms = performance.now() - _t0;
-  _stat.chars = perf.chars - _c0;
-  return out;
 }
 
 async function addListItem(listName, fields) {
@@ -674,8 +716,11 @@ async function loadSKUs() {
 
 async function loadOrders() {
   const cutoff = new Date(); cutoff.setMonth(cutoff.getMonth()-25);
-  const items = await getListItems(LISTS.orders, null,
-    `fields/OrderDate ge '${cutoff.toISOString().substring(0,10)}'`, null, 25000);
+  // Only the fields the app reads below. Every extra column costs ~91k rows
+  // worth of payload. 'id' is added by getListItems from the item level.
+  const FIELDS = 'Title,OrderDate,SKU,Channel,QtySold,QtyReturned,IsExcluded';
+  const items = await getListItems(LISTS.orders, FIELDS,
+    `fields/OrderDate ge '${cutoff.toISOString().substring(0,10)}'`, null, 5000);
   orders = items.map(f=>({
     id:f.id||f.ID, orderNum:f.Title,
     date:f.OrderDate?f.OrderDate.substring(0,10):'',
