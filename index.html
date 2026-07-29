@@ -117,18 +117,6 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
     <div class="metric" style="cursor:pointer" onclick="showPage('forecast');document.getElementById('forecast-filter').value='stockout';renderForecastTable()" title="Click to view affected SKUs"><div class="metric-label">Stockout Gaps Detected</div><div class="metric-value" id="m-stockouts" style="color:var(--warn)">--</div><div class="metric-sub">click to view SKUs</div></div>
   </div>
   <div id="dash-alert" class="alert alert-info hidden"></div>
-  <!-- ===== LOAD DIAGNOSTICS (temporary -- safe to delete this card) ===== -->
-  <div class="card hidden" id="perf-card">
-    <div class="card-header">
-      <span class="card-title">&#9201; Load Diagnostics</span>
-      <span>
-        <button class="btn-sm" onclick="perfCopy()">Copy report</button>
-        <button class="btn-sm" onclick="document.getElementById('perf-card').classList.add('hidden')">Hide</button>
-      </span>
-    </div>
-    <pre id="perf-report" style="margin:0;padding:12px;background:var(--bg);border-radius:6px;font-size:11.5px;line-height:1.55;overflow-x:auto;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"></pre>
-  </div>
-  <!-- ===== END LOAD DIAGNOSTICS ===== -->
   <div class="two-col">
     <div class="card">
       <div class="card-header"><span class="card-title">&#9888; Most Urgent</span><button class="btn-sm" onclick="showPage('forecast');document.getElementById('forecast-filter').value='critical';renderForecastTable()">View all</button></div>
@@ -402,13 +390,10 @@ async function signOut() {
 async function getToken() {
   const accounts = msalInstance.getAllAccounts();
   if (!accounts.length) throw new Error('Not signed in');
-  const _t = performance.now();
   try {
     const r = await msalInstance.acquireTokenSilent({...loginRequest, account:accounts[0]});
-    perf.tokenCalls++; perf.tokenMs += performance.now()-_t;
     return r.accessToken;
   } catch(e) {
-    perf.tokenCalls++; perf.tokenMs += performance.now()-_t;
     // Silent refresh failed -- send the user through a full-page redirect
     // instead of a popup. The page navigates away, so nothing after this runs;
     // the throw just stops callers from using an undefined token in the
@@ -422,27 +407,22 @@ async function onSignedIn(account) {
   document.getElementById('user-name').textContent = account.name || account.username;
   document.getElementById('signout-btn').classList.remove('hidden');
   setBadge('loading','Loading data...');
-  perfReset();
   try {
-    await perfPhase('resolve site id', () => resolveSiteId());
-    await perfPhase('load SKUs',       () => loadSKUs());
-    await perfPhase('load orders',     () => loadOrders());
-    await perfPhase('recalc forecast', async () => recalcAll());
+    await resolveSiteId();
+    await loadSKUs();
+    await loadOrders();
+    recalcAll();
     showPage('dashboard');
-    await perfPhase('render', async () => {
-      renderDashboard();
-      renderForecastTable();
-      renderSKUsTable();
-    });
+    renderDashboard();
+    renderForecastTable();
+    renderSKUsTable();
     setBadge('ok','Connected');
     document.getElementById('last-sync').textContent = 'Synced ' + new Date().toLocaleTimeString();
-    perfShow();
   } catch(e) {
     setBadge('err','Load error');
     showPage('dashboard');
     showAlert('Connection error: ' + e.message + ' -- Check API permissions in Azure.', 'danger');
     console.error(e);
-    perfShow();
   }
 }
 
@@ -451,138 +431,16 @@ function showAlert(msg,type){const el=document.getElementById('dash-alert');el.c
 function showLoginError(msg){const el=document.getElementById('login-error');el.textContent=msg;el.classList.remove('hidden');}
 
 // ============================================================
-// LOAD DIAGNOSTICS (temporary instrumentation -- safe to remove)
-// Measures where initial load time actually goes. Adds no behaviour;
-// only counts, times and sizes what the app was already doing.
-// ============================================================
-const perf = {
-  t0: 0,
-  phases: [],            // [{name, ms}]
-  reqCount: 0,
-  reqMs: 0,              // wall time inside fetch()
-  chars: 0,              // decompressed response size
-  tokenCalls: 0,
-  tokenMs: 0,
-  lists: {},             // listName -> {pages:[rowCount], ms, chars}
-  slowest: [],           // [{ms, url}]
-  errors: 0
-};
-
-function perfReset(){
-  perf.t0 = performance.now();
-  perf.phases = []; perf.reqCount = 0; perf.reqMs = 0; perf.chars = 0;
-  perf.tokenCalls = 0; perf.tokenMs = 0; perf.lists = {}; perf.slowest = []; perf.errors = 0;
-}
-
-async function perfPhase(name, fn){
-  const t = performance.now();
-  try { return await fn(); }
-  finally { perf.phases.push({name, ms: performance.now() - t}); }
-}
-
-function perfFmt(ms){
-  if (ms < 1000) return ms.toFixed(0) + ' ms';
-  return (ms/1000).toFixed(1) + ' s';
-}
-function perfBytes(c){
-  if (c < 1024) return c + ' B';
-  if (c < 1048576) return (c/1024).toFixed(0) + ' KB';
-  return (c/1048576).toFixed(1) + ' MB';
-}
-
-function perfReport(){
-  const total = performance.now() - perf.t0;
-  const L = [];
-  L.push('TOTAL LOAD: ' + perfFmt(total));
-  L.push('');
-  L.push('PHASES');
-  perf.phases.forEach(p=>{
-    const pct = total ? (p.ms/total*100) : 0;
-    L.push('  ' + p.name.padEnd(22) + perfFmt(p.ms).padStart(9) + '   ' + pct.toFixed(0).padStart(3) + '%');
-  });
-  L.push('');
-  L.push('NETWORK');
-  L.push('  Graph requests        ' + String(perf.reqCount).padStart(9));
-  L.push('  Time inside fetch     ' + perfFmt(perf.reqMs).padStart(9) + '   ' + (total?(perf.reqMs/total*100).toFixed(0):0).padStart(3) + '%');
-  L.push('  Avg per request       ' + perfFmt(perf.reqCount?perf.reqMs/perf.reqCount:0).padStart(9));
-  L.push('  Data received         ' + perfBytes(perf.chars).padStart(9) + '   (decompressed)');
-  if (perf.errors) L.push('  Failed requests       ' + String(perf.errors).padStart(9));
-  L.push('');
-  L.push('TOKEN ACQUISITION  (getToken runs on every request)');
-  L.push('  Calls                 ' + String(perf.tokenCalls).padStart(9));
-  L.push('  Total time            ' + perfFmt(perf.tokenMs).padStart(9) + '   ' + (total?(perf.tokenMs/total*100).toFixed(0):0).padStart(3) + '%');
-  L.push('  Avg per call          ' + perfFmt(perf.tokenCalls?perf.tokenMs/perf.tokenCalls:0).padStart(9));
-  L.push('');
-  L.push('PAGINATION BY LIST');
-  Object.keys(perf.lists).forEach(name=>{
-    const d = perf.lists[name];
-    const rows = d.pages.reduce((a,b)=>a+b,0);
-    const sizes = [...new Set(d.pages)].sort((a,b)=>b-a);
-    L.push('  ' + name);
-    L.push('    query               ' + (d.trimmed?'trimmed ($select)':'full fields').padStart(9));
-    L.push('    rows returned       ' + String(rows).padStart(9));
-    L.push('    pages (requests)    ' + String(d.pages.length).padStart(9));
-    L.push('    rows per page       ' + String(d.pages[0]||0).padStart(9) + '   <-- ACTUAL page size cap');
-    if (sizes.length > 2) L.push('    page sizes seen     ' + sizes.slice(0,5).join(', '));
-    L.push('    time                ' + perfFmt(d.ms).padStart(9));
-    L.push('    payload             ' + perfBytes(d.chars).padStart(9));
-    L.push('    bytes per row       ' + String(rows?Math.round(d.chars/rows):0).padStart(9) + '   <-- KEY METRIC');
-    if (d.pages.length > 1) L.push('    avg per page        ' + perfFmt(d.ms/d.pages.length).padStart(9));
-  });
-  if (perf.slowest.length){
-    L.push('');
-    L.push('SLOWEST REQUESTS');
-    perf.slowest.slice(0,5).forEach(s=>{
-      L.push('  ' + perfFmt(s.ms).padStart(8) + '  ' + s.url);
-    });
-  }
-  L.push('');
-  L.push('SCALE');
-  L.push('  SKUs (active)         ' + String(skus.length).padStart(9));
-  L.push('  Order lines loaded    ' + String(orders.length).padStart(9));
-  return L.join('\n');
-}
-
-function perfShow(){
-  const el = document.getElementById('perf-report');
-  if (!el) return;
-  el.textContent = perfReport();
-  document.getElementById('perf-card').classList.remove('hidden');
-}
-
-function perfCopy(){
-  const txt = document.getElementById('perf-report').textContent;
-  navigator.clipboard.writeText(txt)
-    .then(()=>showToast('Report copied to clipboard','ok'))
-    .catch(()=>showToast('Could not copy -- select the text manually','err'));
-}
-
-// ============================================================
 // GRAPH API
 // ============================================================
 async function graphReq(method, url, body) {
   const token = await getToken();
   const h = { 'Authorization':'Bearer '+token, 'Content-Type':'application/json' };
   if (method==='PATCH') h['If-Match'] = '*';
-  const _t = performance.now();
   const res = await fetch(url, { method, headers:h, body:body?JSON.stringify(body):undefined });
-  if (!res.ok) {
-    perf.errors++;
-    perf.reqCount++; perf.reqMs += performance.now()-_t;
-    const txt=await res.text(); throw new Error(`Graph ${method} ${res.status}: ${txt}`);
-  }
-  if (res.status===204) {
-    perf.reqCount++; perf.reqMs += performance.now()-_t;
-    return null;
-  }
-  // Read as text first so the payload can be measured, then parse.
-  const raw = await res.text();
-  const ms = performance.now()-_t;
-  perf.reqCount++; perf.reqMs += ms; perf.chars += raw.length;
-  perf.slowest.push({ms, url: url.length>110 ? url.slice(0,110)+'...' : url});
-  perf.slowest.sort((a,b)=>b.ms-a.ms);
-  if (perf.slowest.length>8) perf.slowest.length = 8;
-  return raw ? JSON.parse(raw) : null;
+  if (!res.ok) { const txt=await res.text(); throw new Error(`Graph ${method} ${res.status}: ${txt}`); }
+  if (res.status===204) return null;
+  return res.json();
 }
 
 async function resolveSiteId() {
@@ -626,10 +484,8 @@ async function getListItems(listName, select, filter, orderby, top=5000) {
   };
 
   const run = async (trimmed) => {
-    const stat = perf.lists[listName] = {pages:[], ms:0, chars:0, trimmed};
-    const t0 = performance.now(), c0 = perf.chars;
     const out = [];
-    let url = buildUrl(trimmed), firstPage = true;
+    let url = buildUrl(trimmed), firstPage = true, pages = 0;
     while (url) {
       let d;
       try {
@@ -641,8 +497,8 @@ async function getListItems(listName, select, filter, orderby, top=5000) {
         throw e;
       }
       firstPage = false;
+      pages++;
       const batch = d.value || [];
-      stat.pages.push(batch.length);
       for (const it of batch) {
         const f = it.fields || it;
         // With $select the item id lives at item level, not inside fields.
@@ -651,12 +507,11 @@ async function getListItems(listName, select, filter, orderby, top=5000) {
         out.push(f);
       }
       url = d['@odata.nextLink'] || null;
-      if (stat.pages.length % 5 === 0) {
+      // Keep the badge alive so a long load does not look frozen.
+      if (url && pages % 3 === 0) {
         setBadge('loading', `Loading ${listName}... ${out.length.toLocaleString()} rows`);
       }
     }
-    stat.ms = performance.now() - t0;
-    stat.chars = perf.chars - c0;
     return out;
   };
 
