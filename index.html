@@ -516,33 +516,50 @@ async function getListItems(listName, select, filter, orderby, top=5000) {
   };
 
   const run = async (trimmed) => {
+    // The badge shows page-by-page progress during long paginated reads, but
+    // it must be handed back exactly as found. Otherwise a later fetch (the
+    // SKU history query, say) leaves "Loading..." on screen indefinitely.
+    const badgeEl = document.getElementById('conn-badge');
+    const badgeWas = badgeEl ? {cls:badgeEl.className, txt:badgeEl.textContent} : null;
+    let badgeTouched = false;
+    const restoreBadge = () => {
+      if (badgeTouched && badgeEl && badgeWas) {
+        badgeEl.className = badgeWas.cls;
+        badgeEl.textContent = badgeWas.txt;
+      }
+    };
     const out = [];
     let url = buildUrl(trimmed), firstPage = true, pages = 0;
-    while (url) {
-      let d;
-      try {
-        d = await graphReq('GET', url);
-      } catch(e) {
-        // Only a failure on the very first page suggests the query shape was
-        // rejected. A later failure is a genuine error and must not be masked.
-        if (firstPage && trimmed) { e._trimRejected = true; }
-        throw e;
+    try {
+      while (url) {
+        let d;
+        try {
+          d = await graphReq('GET', url);
+        } catch(e) {
+          // Only a failure on the very first page suggests the query shape was
+          // rejected. A later failure is a genuine error and must not be masked.
+          if (firstPage && trimmed) { e._trimRejected = true; }
+          throw e;
+        }
+        firstPage = false;
+        pages++;
+        const batch = d.value || [];
+        for (const it of batch) {
+          const f = it.fields || it;
+          // With $select the item id lives at item level, not inside fields.
+          // toggleExclude() patches by this id, so carry it across explicitly.
+          if (f.id === undefined && it.id !== undefined) f.id = it.id;
+          out.push(f);
+        }
+        url = d['@odata.nextLink'] || null;
+        // Keep the badge alive so a long load does not look frozen.
+        if (url && pages % 3 === 0) {
+          badgeTouched = true;
+          setBadge('loading', `Loading ${listName}... ${out.length.toLocaleString()} rows`);
+        }
       }
-      firstPage = false;
-      pages++;
-      const batch = d.value || [];
-      for (const it of batch) {
-        const f = it.fields || it;
-        // With $select the item id lives at item level, not inside fields.
-        // toggleExclude() patches by this id, so carry it across explicitly.
-        if (f.id === undefined && it.id !== undefined) f.id = it.id;
-        out.push(f);
-      }
-      url = d['@odata.nextLink'] || null;
-      // Keep the badge alive so a long load does not look frozen.
-      if (url && pages % 3 === 0) {
-        setBadge('loading', `Loading ${listName}... ${out.length.toLocaleString()} rows`);
-      }
+    } finally {
+      restoreBadge();
     }
     return out;
   };
