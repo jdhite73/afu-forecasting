@@ -62,6 +62,18 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
 .page{display:none}.page.active{display:block}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px}
 .modal{background:var(--surface);border-radius:10px;width:100%;max-width:680px;max-height:90vh;overflow-y:auto;box-shadow:0 8px 40px rgba(0,0,0,0.2)}
+.modal.modal-wide{max-width:1000px}
+.hist-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+.hist-stat{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:11px 13px}
+.hist-stat-label{font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.4px}
+.hist-stat-value{font-size:19px;font-weight:700;margin-top:3px}
+.hist-stat-sub{font-size:11.5px;margin-top:2px}
+.hist-toggle{display:flex;gap:5px}
+.hist-toggle button{font-size:12px;padding:5px 11px;border:1px solid var(--border);background:var(--surface);border-radius:6px;cursor:pointer;color:var(--text-2)}
+.hist-toggle button.on{background:var(--brand);border-color:var(--brand);color:#fff;font-weight:600}
+.hist-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--text-2);margin-top:10px}
+.hist-legend span{display:flex;align-items:center;gap:6px}
+.hist-key{width:11px;height:11px;border-radius:2px;display:inline-block}
 .modal-header{padding:18px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--surface)}
 .modal-body{padding:22px}.modal-footer{padding:14px 22px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px;position:sticky;bottom:0;background:var(--surface)}
 .toast-wrap{position:fixed;bottom:20px;right:20px;z-index:2000;display:flex;flex-direction:column;gap:6px}
@@ -166,6 +178,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
           <th onclick="sortForecast('minShelf')" style="cursor:pointer"><span id="fsh-minShelf">Min Shelf</span></th>
           <th onclick="sortForecast('daysLeft')" style="cursor:pointer"><span id="fsh-daysLeft">Days Left &#9650;</span></th>
           <th onclick="sortForecast('orderQty')" style="cursor:pointer"><span id="fsh-orderQty">Order Qty</span></th>
+          <th onclick="sortForecast('stdOrderQty')" style="cursor:pointer" title="What the textbook periodic-review (R,S) formula would order: demand over (lead + reorder cycle) counted once, with safety stock over that same interval. Evaluation only -- this does not affect the PO export."><span id="fsh-stdOrderQty">Standard (R,S)</span></th>
           <th title="Enter a quantity here to override the forecast on the PO export. Leave blank to use the forecast."><span>PO Override</span></th>
           <th onclick="sortForecast('status')" style="cursor:pointer"><span id="fsh-status">Status</span></th>
           <th></th>
@@ -239,6 +252,25 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
 </div></div>
 
 <!-- SKU MODAL -->
+<div class="modal-overlay hidden" id="hist-modal" onclick="if(event.target===this)closeHistModal()">
+<div class="modal modal-wide">
+  <div class="modal-header">
+    <div>
+      <div style="font-size:15px;font-weight:600" id="hist-title">Sales History</div>
+      <div class="text-muted" id="hist-sub"></div>
+    </div>
+    <span style="display:flex;align-items:center;gap:10px">
+      <span class="hist-toggle" id="hist-toggle">
+        <button id="hist-btn-yoy" onclick="setHistMode('yoy')">Year over year</button>
+        <button id="hist-btn-timeline" onclick="setHistMode('timeline')">18-month timeline</button>
+      </span>
+      <button onclick="closeHistModal()" style="font-size:20px;background:none;border:none;cursor:pointer;color:var(--text-3);padding:4px">&times;</button>
+    </span>
+  </div>
+  <div class="modal-body" id="hist-body"></div>
+</div>
+</div>
+
 <div class="modal-overlay hidden" id="sku-modal" onclick="if(event.target===this)closeSKUModal()">
 <div class="modal">
   <div class="modal-header">
@@ -624,8 +656,11 @@ function buildMonthlyRates(skuOrds, cutoff, now) {
 // Only fires when: SKU sells 5+ days/week historically AND
 // has 3+ consecutive zero-sale days during normally active period
 // ============================================================
-function detectAndFilterStockouts(skuOrds, cutoff, now) {
-  if (!skuOrds.length) return skuOrds;
+// Finds stockout periods for a SKU. Extracted so the history chart shades the
+// exact same periods the forecast corrects for -- one implementation, no drift.
+// Returns null when detection does not apply (slow movers) or none are found.
+function findStockoutPeriods(skuOrds, cutoff, now) {
+  if (!skuOrds.length) return null;
 
   // Build a map of daily net sales
   const daily = {};
@@ -648,7 +683,7 @@ function detectAndFilterStockouts(skuOrds, cutoff, now) {
   const sellFreq = sellingDays / totalDays; // 0 to 1
 
   // Only apply stockout detection to fast movers (sell 5+ days/week = 71%+ of days)
-  if (sellFreq < 0.71) return skuOrds;
+  if (sellFreq < 0.71) return null;
 
   // Find consecutive zero-sale stretches of 3+ days
   const stockoutPeriods = [];
@@ -674,9 +709,9 @@ function detectAndFilterStockouts(skuOrds, cutoff, now) {
     }
   }
 
-  if (!stockoutPeriods.length) return skuOrds;
+  if (!stockoutPeriods.length) return null;
 
-  // Build set of stockout dates to exclude
+  // Build set of stockout dates
   const stockoutDates = new Set();
   for (const period of stockoutPeriods) {
     const sd = new Date(period.start);
@@ -686,14 +721,21 @@ function detectAndFilterStockouts(skuOrds, cutoff, now) {
       sd.setDate(sd.getDate()+1);
     }
   }
+  return { periods: stockoutPeriods, dates: stockoutDates };
+}
+
+function detectAndFilterStockouts(skuOrds, cutoff, now) {
+  if (!skuOrds.length) return skuOrds;
+  const found = findStockoutPeriods(skuOrds, cutoff, now);
+  if (!found) return skuOrds;
 
   // Filter out orders on stockout days
   // (In practice there won't be orders on zero-sale days,
   //  but we also need to exclude those days from the denominator)
   // We return a modified orders array with stockout metadata attached
-  const filtered = skuOrds.filter(o => !stockoutDates.has(o.date));
-  filtered._stockoutDays = stockoutDates.size;
-  filtered._totalStockouts = stockoutPeriods.length;
+  const filtered = skuOrds.filter(o => !found.dates.has(o.date));
+  filtered._stockoutDays = found.dates.size;
+  filtered._totalStockouts = found.periods.length;
   return filtered;
 }
 
@@ -786,7 +828,8 @@ function calcForecast(sku) {
 
   if (!skuOrds.length) return {
     avgDaily:0, forecastDemand:0, bufferStock:0, reorderPoint:Math.max(sku.minShelf,0),
-    reorderPeriodDemand:0, orderQty:0, daysLeft:999, status:'ok', leadDemand:0, modelUsed:'No data'
+    reorderPeriodDemand:0, orderQty:0, daysLeft:999, status:'ok', leadDemand:0, modelUsed:'No data',
+    stdOrderQty:0, stdBufferStock:0
   };
 
   // Run stockout detection and filter affected days from fast-moving SKUs
@@ -857,6 +900,19 @@ function calcForecast(sku) {
   const totalAvail = Math.max(0, sku.soh) + sku.soo;
   const daysLeft = avgDaily > 0 ? Math.round(totalAvail / avgDaily) : 999;
 
+  // --- Textbook periodic-review (R,S) comparison -------------------------
+  // Protection interval is (lead + freq) counted ONCE, and safety stock
+  // covers that same interval rather than lead time alone. Evaluation only:
+  // nothing downstream consumes stdOrderQty, so the live figure is unchanged.
+  const stdBufferStock = Math.round(z * stdDev * Math.sqrt(sku.lead + sku.freq));
+  const stdTarget = Math.round(avgDaily * (sku.lead + sku.freq)) + stdBufferStock + sku.minShelf;
+  let stdRaw = stdTarget - Math.max(0, sku.soh) - sku.soo;
+  stdRaw = Math.max(stdRaw, 0);
+  stdRaw = Math.max(stdRaw, sku.minQty);
+  if (sku.batch > 1 && stdRaw > 0) stdRaw = Math.ceil(stdRaw / sku.batch) * sku.batch;
+  const stdOrderQty = Math.round(stdRaw);
+  // ----------------------------------------------------------------------
+
   // StockTrim-matched order quantity formula
   let rawQty = forecastDemand + bufferStock - Math.max(0,sku.soh) - sku.soo + sku.minShelf + reorderPeriodDemand;
   rawQty = Math.max(rawQty, 0);
@@ -869,7 +925,8 @@ function calcForecast(sku) {
   else if (sku.soh <= reorderPoint || daysLeft <= (sku.lead + sku.freq)) status = 'warn';
 
   return { avgDaily:Math.round(avgDaily*100)/100, forecastDemand, bufferStock, reorderPoint,
-    reorderPeriodDemand, orderQty, daysLeft, status, leadDemand, modelUsed, stockoutDaysDetected };
+    reorderPeriodDemand, orderQty, daysLeft, status, leadDemand, modelUsed, stockoutDaysDetected,
+    stdOrderQty, stdBufferStock };
 }
 function recalcAll(){
   forecast=skus.map(s=>({sku:s,...calcForecast(s)}));
@@ -928,13 +985,13 @@ function sortForecast(col){
   } else {
     forecastSort.col=col;
     // Numeric columns default desc, text columns default asc
-    const numCols=['soh','soo','avgDaily','lead','forecastDemand','bufferStock','reorderPoint','minShelf','daysLeft','orderQty'];
+    const numCols=['soh','soo','avgDaily','lead','forecastDemand','bufferStock','reorderPoint','minShelf','daysLeft','orderQty','stdOrderQty'];
     forecastSort.dir=numCols.includes(col)?'desc':'asc';
   }
   // Update header indicators
   const cols={code:'Code',name:'Name',series:'Series',soh:'On Hand',soo:'On Order',
     avgDaily:'Avg Daily',model:'Model',lead:'Lead Time',forecastDemand:'Forecast Demand',
-    bufferStock:'Buffer Stock',reorderPoint:'Reorder Point',minShelf:'Min Shelf',
+    bufferStock:'Buffer Stock',reorderPoint:'Reorder Point',minShelf:'Min Shelf',stdOrderQty:'Standard (R,S)',
     daysLeft:'Days Left',orderQty:'Order Qty',status:'Status'};
   Object.keys(cols).forEach(c=>{
     const el=document.getElementById('fsh-'+c);
@@ -990,10 +1047,11 @@ function renderForecastTable(){
     <td>${f.sku.minShelf.toLocaleString()}</td>
     <td><span class="badge ${f.daysLeft<=f.sku.lead?'badge-danger':f.daysLeft<=21?'badge-warn':'badge-ok'}">${f.daysLeft>=999?'>365':f.daysLeft+'d'}</span></td>
     <td style="font-weight:700;color:${f.orderQty>0?'var(--brand)':'var(--text-3)'}">${f.orderQty>0?f.orderQty.toLocaleString():'--'}</td>
+    <td style="white-space:nowrap">${(f.orderQty>0||f.stdOrderQty>0)?`<span style="font-weight:600">${f.stdOrderQty.toLocaleString()}</span>${f.stdOrderQty!==f.orderQty?` <span style="font-size:11px;color:${f.stdOrderQty<f.orderQty?'var(--danger)':'var(--ok)'}">${f.stdOrderQty<f.orderQty?'\u2212':'+'}${Math.abs(f.stdOrderQty-f.orderQty).toLocaleString()}</span>`:''}`:'<span class="text-muted">--</span>'}</td>
     <td><input type="number" min="0" step="1" class="po-ovr${poOverrides[f.sku.code]!==undefined?' set':''}" value="${poOverrides[f.sku.code]!==undefined?poOverrides[f.sku.code]:''}" placeholder="${f.orderQty>0?f.orderQty:'--'}" onchange="setPOOverride('${f.sku.code}',this.value)"></td>
     <td>${f.status==='critical'?'<span class="badge badge-danger">Order now</span>':f.status==='warn'?'<span class="badge badge-warn">Reorder soon</span>':'<span class="badge badge-ok">Healthy</span>'}</td>
-    <td><button class="btn-sm" onclick="openSKUModal('${f.sku.code}')">Settings</button></td>
-  </tr>`).join('')||'<tr><td colspan="17" class="text-muted" style="padding:20px;text-align:center">No results</td></tr>';
+    <td style="white-space:nowrap"><button class="btn-sm" onclick="openHistoryModal('${f.sku.code}')">History</button> <button class="btn-sm" onclick="openSKUModal('${f.sku.code}')">Settings</button></td>
+  </tr>`).join('')||'<tr><td colspan="18" class="text-muted" style="padding:20px;text-align:center">No results</td></tr>';
   updateOverrideBadge();
 }
 
@@ -1242,6 +1300,441 @@ function openSKUModal(code){
 }
 function closeSKUModal(){document.getElementById('sku-modal').classList.add('hidden');}
 
+// ============================================================
+// SKU SALES HISTORY
+// 18 months of net units with a prior-year comparison. Data is fetched
+// on demand for the single SKU so the 30-month window needed for a full
+// year-over-year view does not enlarge the initial app load.
+// ============================================================
+const HIST_MONTHS = 18;
+const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+let histState = { code:null, rows:[], mode:'yoy', source:'live' };
+
+function monthLabelOf(key){ const p=key.split('-'); return MONTH_ABBR[+p[1]-1]+" '"+p[0].slice(2); }
+
+function niceMax(v){
+  if(v<=0) return 10;
+  const e=Math.pow(10,Math.floor(Math.log10(v)));
+  const f=v/e;
+  return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*e;
+}
+
+// Pull enough history for a calendar year-over-year view (back to 1 Jan of
+// two years ago) and for the 18-month timeline, whichever reaches further
+// back. Requires SKU to be an indexed column in SharePoint; if it is not,
+// the query is rejected and we fall back to the months already in memory.
+function histWindowStart(now){
+  const byYear=new Date(now.getFullYear()-2, 0, 1);
+  const byMonths=new Date(now); byMonths.setDate(1); byMonths.setMonth(byMonths.getMonth()-(HIST_MONTHS+12));
+  return byYear < byMonths ? byYear : byMonths;
+}
+
+async function fetchSKUHistory(code, now){
+  const cutoff=histWindowStart(now);
+  const esc=String(code).replace(/'/g,"''");
+  const FIELDS='Title,OrderDate,SKU,Channel,QtySold,QtyReturned,IsExcluded';
+  const filter=`fields/SKU eq '${esc}' and fields/OrderDate ge '${cutoff.toISOString().substring(0,10)}'`;
+  const items=await getListItems(LISTS.orders, FIELDS, filter, null, 5000);
+  return items.map(f=>({
+    date: f.OrderDate?f.OrderDate.substring(0,10):'',
+    sku: f.SKU, channel: f.Channel,
+    qtySold: parseInt(f.QtySold)||0,
+    qtyReturned: parseInt(f.QtyReturned)||0,
+    excluded: f.IsExcluded===true||f.IsExcluded==='Yes'
+  }));
+}
+
+// Same basis as the forecast: excluded orders and Wholesale are left out.
+function histBasis(rows){
+  return rows.filter(o=>o.date && !o.excluded && o.channel!=='Wholesale');
+}
+
+function buildHistory(rows, now){
+  const anchor=new Date(now.getFullYear(), now.getMonth(), 1);
+  const keys=[];
+  for(let i=HIST_MONTHS+11;i>=0;i--){
+    const d=new Date(anchor); d.setMonth(d.getMonth()-i);
+    keys.push(d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'));
+  }
+  const sums={}; keys.forEach(k=>sums[k]=0);
+  const curKey=keys[keys.length-1];
+  const priorOfCur=keys[keys.length-13];
+  const today=now.getDate();
+  let priorCurPartial=0;
+  for(const o of rows){
+    const k=o.date.substring(0,7);
+    if(sums[k]===undefined) continue;
+    const net=Math.max(0,o.qtySold-o.qtyReturned);
+    sums[k]+=net;
+    // The in-progress month must be compared against the same slice of last
+    // year, or the newest bar always looks like a collapse.
+    if(k===priorOfCur && parseInt(o.date.substring(8,10),10)<=today) priorCurPartial+=net;
+  }
+  const disp=keys.slice(12);
+  return disp.map((k,i)=>({
+    key:k, label:monthLabelOf(k), cur:sums[k],
+    prev: k===curKey ? priorCurPartial : sums[keys[i]],
+    partial: k===curKey
+  }));
+}
+
+function histYTD(rows, now){
+  const y=now.getFullYear(), md=(now.getMonth()+1)*100+now.getDate();
+  let cur=0, prev=0;
+  for(const o of rows){
+    const omd=(+o.date.substring(5,7))*100+(+o.date.substring(8,10));
+    if(omd>md) continue;
+    const oy=+o.date.substring(0,4);
+    const net=Math.max(0,o.qtySold-o.qtyReturned);
+    if(oy===y) cur+=net; else if(oy===y-1) prev+=net;
+  }
+  return {cur, prev};
+}
+
+function pctChange(cur, prev){
+  if(!prev) return cur>0 ? {txt:'new', cls:'', val:null} : {txt:'--', cls:'', val:null};
+  const v=(cur-prev)/prev*100;
+  return { txt:(v>=0?'+':'')+v.toFixed(0)+'%', val:v,
+           cls: v>=0?'color:var(--ok)':'color:var(--danger)' };
+}
+
+// Count stockout-affected days per month, using the same detection the
+// forecast applies, so the chart explains rather than contradicts it.
+function histStockoutByMonth(rows, windowStart, now){
+  const found=findStockoutPeriods(rows.filter(o=>new Date(o.date)>=windowStart), windowStart, now);
+  const out={};
+  if(!found) return out;
+  found.dates.forEach(d=>{ const k=d.substring(0,7); out[k]=(out[k]||0)+1; });
+  return out;
+}
+
+// Builds one 12-point series per calendar year. Months outside the loaded
+// window, and months later than today in the current year, stay null so the
+// line stops rather than dropping to a false zero.
+function buildYearSeries(rows, now, windowStart){
+  const curY=now.getFullYear(), curM=now.getMonth();
+  const years=[curY-2, curY-1, curY];
+  const data={};
+  years.forEach(y=>{
+    data[y]=new Array(12).fill(null);
+    for(let m=0;m<12;m++){
+      const monthEnd=new Date(y, m+1, 0);
+      const inWindow = monthEnd >= windowStart;
+      const notFuture = (y<curY) || (m<=curM);
+      if(inWindow && notFuture) data[y][m]=0;
+    }
+  });
+  for(const o of rows){
+    const y=+o.date.substring(0,4);
+    if(!data[y]) continue;
+    const m=+o.date.substring(5,7)-1;
+    if(data[y][m]===null) continue;
+    data[y][m]+=Math.max(0,o.qtySold-o.qtyReturned);
+  }
+  return years.map(y=>({
+    year:y, values:data[y],
+    partialIdx: y===curY ? curM : -1,
+    total: data[y].reduce((a,v)=>a+(v||0),0)
+  })).filter(s=>s.values.some(v=>v!==null));
+}
+
+function histYearSVG(series, stockByMonth){
+  const W=920,H=340,mL=56,mR=14,mT=16,mB=44;
+  const pw=W-mL-mR, ph=H-mT-mB;
+  const X=i=>mL+(pw/11)*i;
+  let peak=1;
+  series.forEach(s=>s.values.forEach(v=>{ if(v!==null&&v>peak) peak=v; }));
+  const top=niceMax(peak);
+  const Y=v=>mT+ph-(v/top)*ph;
+  const esc=t=>String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+  // Oldest year recedes into the background; the two that matter are bold.
+  const style=(idx,total)=>{
+    const age=total-1-idx;                       // 0 = current year
+    if(age===0) return {c:'var(--brand)', w:2.6, o:1,    dot:4,   dash:''};
+    if(age===1) return {c:'var(--warn)',  w:2.2, o:0.95, dot:3.4, dash:''};
+    return             {c:'var(--text-3)',w:1.6, o:0.5,  dot:0,   dash:'5 4'};
+  };
+
+  let s='';
+  // horizontal gridlines
+  for(let g=0; g<=4; g++){
+    const v=top*g/4, y=Y(v);
+    s+=`<line x1="${mL}" y1="${y.toFixed(1)}" x2="${W-mR}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-width="1"/>`;
+    s+=`<text x="${mL-9}" y="${(y+4).toFixed(1)}" text-anchor="end" font-size="11.5" fill="var(--text-3)">${Math.round(v).toLocaleString()}</text>`;
+  }
+  // faint vertical guides
+  for(let i=0;i<12;i++){
+    s+=`<line x1="${X(i).toFixed(1)}" y1="${mT}" x2="${X(i).toFixed(1)}" y2="${mT+ph}" stroke="var(--border)" stroke-width="1" opacity="0.45"/>`;
+  }
+
+  series.forEach((ser,si)=>{
+    const st=style(si, series.length);
+    const pts=[];
+    ser.values.forEach((v,i)=>{ if(v!==null) pts.push({i, v, x:X(i), y:Y(v)}); });
+    if(!pts.length) return;
+    // Solid through the last complete month, dashed into the partial one.
+    const solid = ser.partialIdx>=0 ? pts.filter(p=>p.i<ser.partialIdx) : pts;
+    if(solid.length>1){
+      s+=`<polyline points="${solid.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ')}" fill="none" stroke="${st.c}" stroke-width="${st.w}" stroke-linejoin="round" stroke-linecap="round" opacity="${st.o}"${st.dash?` stroke-dasharray="${st.dash}"`:''}/>`;
+    }
+    if(ser.partialIdx>=0 && solid.length){
+      const a=solid[solid.length-1], b=pts[pts.length-1];
+      if(b.i===ser.partialIdx){
+        s+=`<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="${st.c}" stroke-width="${st.w}" stroke-dasharray="4 3" opacity="${st.o}"/>`;
+      }
+    }
+    if(st.dot){
+      pts.forEach(p=>{
+        const key=ser.year+'-'+String(p.i+1).padStart(2,'0');
+        const days=stockByMonth[key]||0;
+        const partial = p.i===ser.partialIdx;
+        if(days>0){
+          s+=`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${st.dot+3.5}" fill="none" stroke="var(--warn)" stroke-width="2" opacity="0.85"/>`;
+        }
+        s+=`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${st.dot}" fill="${partial?'var(--surface)':st.c}" stroke="${st.c}" stroke-width="${partial?2.4:0}" opacity="${st.o}">`
+         + `<title>${MONTH_ABBR[p.i]} ${ser.year}: ${p.v.toLocaleString()} units${partial?' (month to date)':''}${days?` -- ${days} stockout day${days===1?'':'s'}`:''}</title></circle>`;
+      });
+    }
+  });
+
+  s+=`<line x1="${mL}" y1="${mT+ph}" x2="${W-mR}" y2="${mT+ph}" stroke="var(--text-3)" stroke-width="1"/>`;
+  for(let i=0;i<12;i++){
+    s+=`<text x="${X(i).toFixed(1)}" y="${mT+ph+19}" text-anchor="middle" font-size="11.5" fill="var(--text-2)">${MONTH_ABBR[i]}</text>`;
+  }
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Monthly net units by calendar year">${s}</svg>`;
+}
+
+function histChartSVG(months, mode, stockByMonth){
+  const W=920,H=300,mL=52,mR=14,mT=14,mB=54;
+  const pw=W-mL-mR, ph=H-mT-mB, n=months.length, band=pw/n;
+  const peak=Math.max(1,...months.map(m=>Math.max(m.cur,m.prev)));
+  const top=niceMax(peak);
+  const Y=v=>mT+ph-(v/top)*ph;
+  const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  let s='';
+
+  s+=`<defs><pattern id="hatch" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">`
+   + `<rect width="6" height="6" fill="var(--brand)" opacity="0.25"/>`
+   + `<line x1="0" y1="0" x2="0" y2="6" stroke="var(--brand)" stroke-width="3"/></pattern></defs>`;
+
+  // stockout bands behind everything
+  months.forEach((m,i)=>{
+    const days=stockByMonth[m.key]||0;
+    if(days>0){
+      s+=`<rect x="${(mL+i*band).toFixed(1)}" y="${mT}" width="${band.toFixed(1)}" height="${ph}" fill="var(--warn)" opacity="0.13"><title>${esc(m.label)}: ${days} stockout day${days===1?'':'s'} detected</title></rect>`;
+    }
+  });
+
+  // gridlines + y axis labels
+  for(let g=0; g<=4; g++){
+    const v=top*g/4, y=Y(v);
+    s+=`<line x1="${mL}" y1="${y.toFixed(1)}" x2="${W-mR}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-width="1"/>`;
+    s+=`<text x="${mL-8}" y="${(y+4).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--text-3)">${Math.round(v).toLocaleString()}</text>`;
+  }
+
+  if(mode==='grouped'){
+    const bw=Math.max(3,(band-8)/2);
+    months.forEach((m,i)=>{
+      const x0=mL+i*band+(band-bw*2)/2;
+      const hP=Math.max(0,ph-(Y(m.prev)-mT)), hC=Math.max(0,ph-(Y(m.cur)-mT));
+      s+=`<rect x="${x0.toFixed(1)}" y="${Y(m.prev).toFixed(1)}" width="${bw.toFixed(1)}" height="${hP.toFixed(1)}" fill="var(--text-3)" opacity="0.55" rx="1.5"><title>${esc(m.label)} prior year: ${m.prev.toLocaleString()}</title></rect>`;
+      s+=`<rect x="${(x0+bw).toFixed(1)}" y="${Y(m.cur).toFixed(1)}" width="${bw.toFixed(1)}" height="${hC.toFixed(1)}" fill="${m.partial?'url(#hatch)':'var(--brand)'}" rx="1.5"><title>${esc(m.label)}: ${m.cur.toLocaleString()}${m.partial?' (month to date)':''}</title></rect>`;
+    });
+  } else {
+    const bw=Math.max(4,band-10);
+    months.forEach((m,i)=>{
+      const x=mL+i*band+(band-bw)/2;
+      const h=Math.max(0,ph-(Y(m.cur)-mT));
+      s+=`<rect x="${x.toFixed(1)}" y="${Y(m.cur).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${m.partial?'url(#hatch)':'var(--brand)'}" rx="2"><title>${esc(m.label)}: ${m.cur.toLocaleString()}${m.partial?' (month to date)':''} | prior year ${m.prev.toLocaleString()}</title></rect>`;
+    });
+    const pts=months.map((m,i)=>`${(mL+i*band+band/2).toFixed(1)},${Y(m.prev).toFixed(1)}`).join(' ');
+    s+=`<polyline points="${pts}" fill="none" stroke="var(--warn)" stroke-width="2" stroke-linejoin="round"/>`;
+    months.forEach((m,i)=>{
+      s+=`<circle cx="${(mL+i*band+band/2).toFixed(1)}" cy="${Y(m.prev).toFixed(1)}" r="3" fill="var(--surface)" stroke="var(--warn)" stroke-width="2"><title>${esc(m.label)} prior year: ${m.prev.toLocaleString()}${m.partial?' (same days)':''}</title></circle>`;
+    });
+  }
+
+  // baseline + x labels
+  s+=`<line x1="${mL}" y1="${mT+ph}" x2="${W-mR}" y2="${mT+ph}" stroke="var(--text-3)" stroke-width="1"/>`;
+  months.forEach((m,i)=>{
+    const x=mL+i*band+band/2;
+    s+=`<text x="${x.toFixed(1)}" y="${mT+ph+16}" text-anchor="middle" font-size="10" fill="var(--text-3)" transform="rotate(-40 ${x.toFixed(1)} ${mT+ph+16})">${esc(m.label)}</text>`;
+  });
+
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block;overflow:visible" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Monthly net units sold, last ${HIST_MONTHS} months with prior-year comparison">${s}</svg>`;
+}
+
+// Reconstructs the order-quantity arithmetic from the values calcForecast
+// already returns, so the panel cannot drift from the number in the table.
+// Mirrors: rawQty = forecastDemand + bufferStock - soh - soo + minShelf
+//                   + reorderPeriodDemand, then floors and batch rounding.
+function histCalcPanel(f){
+  if(!f) return '';
+  const s=f.sku;
+  const soh=Math.max(0,s.soh), soo=s.soo||0;
+  const lines=[
+    {l:`Demand over lead time + reorder cycle (${s.lead + s.freq} days)`, v:f.forecastDemand},
+    {l:`Reorder period demand (${s.freq} days)`,                          v:f.reorderPeriodDemand},
+    {l:`Buffer stock (${Math.round(s.serviceLevel*100)}% service level)`, v:f.bufferStock},
+    {l:'Minimum shelf level',                                             v:s.minShelf},
+    {l:'On hand',                                                         v:-soh},
+    {l:'On order',                                                        v:-soo}
+  ];
+  const raw=lines.reduce((a,r)=>a+r.v,0);
+  const afterZero=Math.max(raw,0);
+  const afterMin=Math.max(afterZero, s.minQty||0);
+  const afterBatch=(s.batch>1 && afterMin>0) ? Math.ceil(afterMin/s.batch)*s.batch : afterMin;
+
+  // Which single input is doing the most to inflate the number?
+  const pos=lines.filter(r=>r.v>0).sort((a,b)=>b.v-a.v);
+  const driver=pos.length?pos[0]:null;
+
+  const row=(label,val,opt={})=>`<tr>
+      <td style="padding:5px 0;color:${opt.strong?'var(--text)':'var(--text-2)'};font-weight:${opt.strong?600:400}">${label}${opt.tag?` <span class="badge badge-warn" style="font-size:10px;margin-left:5px">${opt.tag}</span>`:''}</td>
+      <td style="padding:5px 0;text-align:right;font-variant-numeric:tabular-nums;font-weight:${opt.strong?700:600};color:${opt.color||(val<0?'var(--danger)':val===0?'var(--text-3)':'var(--text)')}">${val===0?'0':(val<0?'\u2212':'+')+Math.abs(val).toLocaleString()}</td>
+    </tr>`;
+
+  let body=lines.map(r=>row(r.l, r.v, {tag: driver&&r===driver?'largest driver':''})).join('');
+  body+=`<tr><td colspan="2" style="border-top:1px solid var(--border);padding:0"></td></tr>`;
+  body+=`<tr><td style="padding:6px 0;font-weight:600">Subtotal</td><td style="padding:6px 0;text-align:right;font-weight:700;font-variant-numeric:tabular-nums">${raw.toLocaleString()}</td></tr>`;
+  if(raw<0) body+=`<tr><td style="padding:4px 0;color:var(--text-3)">Floored at zero</td><td style="padding:4px 0;text-align:right;color:var(--text-3)">0</td></tr>`;
+  if((s.minQty||0)>afterZero) body+=`<tr><td style="padding:4px 0;color:var(--warn)">Raised to minimum order qty (${s.minQty})</td><td style="padding:4px 0;text-align:right;font-weight:600;color:var(--warn);font-variant-numeric:tabular-nums">${afterMin.toLocaleString()}</td></tr>`;
+  if(afterBatch!==afterMin) body+=`<tr><td style="padding:4px 0;color:var(--warn)">Rounded up to batch size (${s.batch})</td><td style="padding:4px 0;text-align:right;font-weight:600;color:var(--warn);font-variant-numeric:tabular-nums">${afterBatch.toLocaleString()}</td></tr>`;
+
+  const mismatch = afterBatch!==f.orderQty;
+
+  return `
+  <div class="card" style="margin-top:18px">
+    <div class="card-header"><span class="card-title">How this order quantity was calculated</span>
+      <span style="font-size:12px;color:var(--text-3)">${f.modelUsed}${f.stockoutDaysDetected?` &middot; ${f.stockoutDaysDetected} stockout days excluded`:''}</span>
+    </div>
+    <div style="padding:4px 14px 14px">
+      <div style="display:flex;gap:22px;flex-wrap:wrap;font-size:12px;color:var(--text-2);padding:8px 0 12px;border-bottom:1px solid var(--border);margin-bottom:6px">
+        <span><strong style="color:var(--text)">${f.avgDaily}</strong> avg units/day</span>
+        <span><strong style="color:var(--text)">${s.lead}</strong> day lead time</span>
+        <span><strong style="color:var(--text)">${s.freq}</strong> day reorder cycle</span>
+        <span><strong style="color:var(--text)">${s.soh.toLocaleString()}</strong> on hand</span>
+        <span><strong style="color:var(--text)">${f.daysLeft>=999?'--':f.daysLeft}</strong> days left</span>
+      </div>
+      <table style="width:100%;font-size:13px;border-collapse:collapse">${body}</table>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;padding-top:11px;border-top:2px solid var(--text)">
+        <span style="font-weight:700;font-size:14px">Order quantity</span>
+        <span style="font-weight:700;font-size:20px;color:var(--brand);font-variant-numeric:tabular-nums">${f.orderQty.toLocaleString()}</span>
+      </div>
+      ${mismatch?`<div class="alert alert-warn" style="margin-top:10px">This breakdown totals ${afterBatch.toLocaleString()} but the forecast reports ${f.orderQty.toLocaleString()}. Treat the forecast value as authoritative and report this discrepancy.</div>`:''}
+      ${f.stdOrderQty!==undefined?`
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <span style="font-size:13px;color:var(--text-2)">Standard periodic-review (R,S) formula would order</span>
+          <span style="font-weight:700;font-size:15px;font-variant-numeric:tabular-nums;color:${f.stdOrderQty<f.orderQty?'var(--danger)':f.stdOrderQty>f.orderQty?'var(--ok)':'var(--text)'}">${f.stdOrderQty.toLocaleString()}${f.stdOrderQty!==f.orderQty?` (${f.stdOrderQty<f.orderQty?'\u2212':'+'}${Math.abs(f.stdOrderQty-f.orderQty).toLocaleString()})`:''}</span>
+        </div>
+        <div class="text-muted" style="font-size:11.5px;margin-top:5px">
+          Counts the ${s.lead + s.freq}-day protection interval once instead of adding the ${s.freq}-day reorder period twice, and sizes buffer stock over the full interval (${f.stdBufferStock} vs ${f.bufferStock}). Shown for comparison only &mdash; the PO export uses the figure above.
+        </div>
+      </div>`:''}
+      ${poOverrides[s.code]!==undefined?`<div class="alert alert-info" style="margin-top:10px">A PO override of <strong>${poOverrides[s.code].toLocaleString()}</strong> is set for this SKU, so the export will use that instead.</div>`:''}
+    </div>
+  </div>`;
+}
+
+function renderHistBody(){
+  const el=document.getElementById('hist-body');
+  const rows=histBasis(histState.rows);
+  const now=new Date();
+  const windowStart = histState.source==='memory'
+    ? (()=>{const d=new Date(now); d.setMonth(d.getMonth()-25); return d;})()
+    : histWindowStart(now);
+  const months=buildHistory(rows, now);
+  const stock=histStockoutByMonth(rows, windowStart, now);
+  const ytd=histYTD(rows, now);
+
+  const last12=months.slice(6).reduce((a,m)=>a+m.cur,0);
+  const prev12=months.slice(6).reduce((a,m)=>a+m.prev,0);
+  const ytdD=pctChange(ytd.cur, ytd.prev), ttmD=pctChange(last12, prev12);
+  const avg=Math.round(last12/12);
+
+  document.getElementById('hist-btn-yoy').classList.toggle('on', histState.mode==='yoy');
+  document.getElementById('hist-btn-timeline').classList.toggle('on', histState.mode==='timeline');
+
+  const stockMonths=Object.keys(stock).length;
+  let notes='';
+  if(histState.source==='memory'){
+    notes+=`<div class="alert alert-warn" style="margin-bottom:14px">Showing only the months already loaded, so earlier years may be incomplete. For the full comparison, add <strong>SKU</strong> as an indexed column in the SharePoint Orders list settings.</div>`;
+  }
+
+  let chart, legend;
+  if(histState.mode==='yoy'){
+    const series=buildYearSeries(rows, now, windowStart);
+    chart=histYearSVG(series, stock);
+    legend=series.map((ser,i)=>{
+      const age=series.length-1-i;
+      const c = age===0?'var(--brand)' : age===1?'var(--warn)' : 'var(--text-3)';
+      const label = age===0 ? ser.year+' (year to date)' : String(ser.year);
+      return `<span><i class="hist-key" style="background:${c};opacity:${age>1?0.5:1}"></i>${label} &mdash; ${ser.total.toLocaleString()} units</span>`;
+    }).join('');
+    legend+=`<span><i class="hist-key" style="border:2px solid var(--brand);background:var(--surface)"></i>Month to date (partial)</span>`;
+  } else {
+    chart=histChartSVG(months, 'overlay', stock);
+    legend=`<span><i class="hist-key" style="background:var(--brand)"></i>Current period</span>`
+         + `<span><i class="hist-key" style="background:var(--warn)"></i>Prior year</span>`
+         + `<span><i class="hist-key" style="background:var(--brand);opacity:0.3"></i>Month to date (partial)</span>`;
+  }
+  if(stockMonths){
+    legend+=`<span><i class="hist-key" style="border:2px solid var(--warn);border-radius:50%;background:none"></i>Stockout gap detected</span>`;
+  }
+  legend+=`<span class="text-muted">Net units, excludes Wholesale and excluded orders</span>`;
+
+  el.innerHTML=`
+    ${notes}
+    <div class="hist-stats">
+      <div class="hist-stat">
+        <div class="hist-stat-label">Year to date</div>
+        <div class="hist-stat-value">${ytd.cur.toLocaleString()}</div>
+        <div class="hist-stat-sub" style="${ytdD.cls}">${ytdD.txt} vs ${ytd.prev.toLocaleString()} same period last year</div>
+      </div>
+      <div class="hist-stat">
+        <div class="hist-stat-label">Last 12 months</div>
+        <div class="hist-stat-value">${last12.toLocaleString()}</div>
+        <div class="hist-stat-sub" style="${ttmD.cls}">${ttmD.txt} vs ${prev12.toLocaleString()} prior 12 months</div>
+      </div>
+      <div class="hist-stat">
+        <div class="hist-stat-label">Avg / month</div>
+        <div class="hist-stat-value">${avg.toLocaleString()}</div>
+        <div class="hist-stat-sub text-muted">trailing 12 months</div>
+      </div>
+    </div>
+    ${chart}
+    <div class="hist-legend">${legend}</div>
+    ${stockMonths?'<div class="text-muted" style="margin-top:8px;font-size:11.5px">Ringed points are months containing days flagged as Amazon stockout gaps and excluded from velocity. Dips there are likely availability, not demand.</div>':''}
+    ${histCalcPanel(forecast.find(x=>x.sku.code===histState.code))}`;
+}
+
+function setHistMode(m){ histState.mode=m; renderHistBody(); }
+function closeHistModal(){ document.getElementById('hist-modal').classList.add('hidden'); }
+
+async function openHistoryModal(code){
+  const s=skus.find(x=>x.code===code);
+  document.getElementById('hist-title').textContent='Sales History -- '+code;
+  document.getElementById('hist-sub').textContent=s?s.name:'';
+  document.getElementById('hist-body').innerHTML='<div class="text-muted" style="padding:40px;text-align:center">Loading history...</div>';
+  document.getElementById('hist-modal').classList.remove('hidden');
+  histState={code, rows:[], mode:histState.mode||'yoy', source:'live'};
+  try{
+    histState.rows=await fetchSKUHistory(code, new Date());
+  }catch(e){
+    // Most likely SKU is not an indexed column. Fall back to what is loaded.
+    console.warn('SKU history query failed, using in-memory orders:', e.message);
+    histState.rows=orders.filter(o=>o.sku===code);
+    histState.source='memory';
+  }
+  if(!histState.rows.length){
+    document.getElementById('hist-body').innerHTML='<div class="text-muted" style="padding:40px;text-align:center">No order history found for this SKU.</div>';
+    return;
+  }
+  renderHistBody();
+}
+
 async function saveSKU(){
   const id=document.getElementById('m-id').value;
   const code=document.getElementById('m-code').value.trim();
@@ -1261,12 +1754,15 @@ async function saveSKU(){
 // EXPORT
 // ============================================================
 function exportForecast(){
-  const rows=[['Code','Name','On Hand','On Order','Avg Daily Sales','Lead Time (days)','Forecast Demand','Buffer Stock','Reorder Point','Days Left','Order Qty','Status','Unit Cost','Order Value ($)']];
+  const rows=[['Code','Name','On Hand','On Order','Avg Daily Sales','Lead Time (days)','Reorder Cycle (days)','Forecast Demand','Buffer Stock','Reorder Point','Days Left','Order Qty','Standard (R,S) Qty','Delta','Delta %','Cycle Share R/(L+R)','Status','Unit Cost','Order Value ($)','Standard Value ($)']];
   forecast.filter(f=>f.orderQty>0||f.status!=='ok').sort((a,b)=>{const o={critical:0,warn:1,ok:2};return(o[a.status]||3)-(o[b.status]||3);}).forEach(f=>{
-    rows.push([f.sku.code,f.sku.name,Math.max(0,f.sku.soh),f.sku.soo,f.avgDaily,f.sku.lead,f.forecastDemand,f.bufferStock,f.reorderPoint,f.daysLeft>=999?'>365':f.daysLeft,f.orderQty,f.status==='critical'?'Order now':f.status==='warn'?'Reorder soon':'Healthy',f.sku.cost,Math.round(f.orderQty*f.sku.cost*100)/100]);
+    const delta=f.stdOrderQty-f.orderQty;
+    const deltaPct=f.orderQty>0?Math.round(delta/f.orderQty*1000)/10:'';
+    const share=Math.round(f.sku.freq/(f.sku.lead+f.sku.freq)*1000)/1000;
+    rows.push([f.sku.code,f.sku.name,Math.max(0,f.sku.soh),f.sku.soo,f.avgDaily,f.sku.lead,f.sku.freq,f.forecastDemand,f.bufferStock,f.reorderPoint,f.daysLeft>=999?'>365':f.daysLeft,f.orderQty,f.stdOrderQty,delta,deltaPct,share,f.status==='critical'?'Order now':f.status==='warn'?'Reorder soon':'Healthy',f.sku.cost,Math.round(f.orderQty*f.sku.cost*100)/100,Math.round(f.stdOrderQty*f.sku.cost*100)/100]);
   });
   const ws=XLSX.utils.aoa_to_sheet(rows);
-  ws['!cols']=[{wch:18},{wch:42},{wch:10},{wch:10},{wch:14},{wch:14},{wch:16},{wch:13},{wch:14},{wch:10},{wch:10},{wch:13},{wch:10},{wch:14}];
+  ws['!cols']=[{wch:18},{wch:42},{wch:10},{wch:10},{wch:14},{wch:14},{wch:16},{wch:16},{wch:13},{wch:14},{wch:10},{wch:10},{wch:16},{wch:9},{wch:9},{wch:18},{wch:13},{wch:10},{wch:14},{wch:16}];
   const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Forecast '+new Date().toISOString().substring(0,10));
   XLSX.writeFile(wb,'Forecast_'+new Date().toISOString().substring(0,10)+'.xlsx');
   showToast('Exported to Excel','ok');
