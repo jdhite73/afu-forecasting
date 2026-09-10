@@ -8,7 +8,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.0/lib/msal-browser.min.js" onerror="msalLoadFailed()"></script>
 <style>
-:root{--brand:#1F5C99;--brand-light:#D5E8F4;--brand-dark:#163f6b;--danger:#C0392B;--danger-light:#FDECEA;--warn:#E67E22;--warn-light:#FEF3E2;--ok:#27AE60;--ok-light:#E8F8EE;--bg:#F4F6F9;--surface:#FFFFFF;--border:#DDE3EC;--text:#1A2332;--text-2:#4A5568;--text-3:#8A95A3;--radius:8px;--shadow:0 1px 3px rgba(0,0,0,0.08)}
+:root{--amz:#6B4E9E;--amz-light:#F1ECF9;--brand:#1F5C99;--brand-light:#D5E8F4;--brand-dark:#163f6b;--danger:#C0392B;--danger-light:#FDECEA;--warn:#E67E22;--warn-light:#FEF3E2;--ok:#27AE60;--ok-light:#E8F8EE;--bg:#F4F6F9;--surface:#FFFFFF;--border:#DDE3EC;--text:#1A2332;--text-2:#4A5568;--text-3:#8A95A3;--radius:8px;--shadow:0 1px 3px rgba(0,0,0,0.08)}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Lato',system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:14px;min-height:100vh}
 .app{display:flex;flex-direction:column;min-height:100vh}
@@ -74,6 +74,9 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
 .hist-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--text-2);margin-top:10px}
 .hist-legend span{display:flex;align-items:center;gap:6px}
 .hist-key{width:11px;height:11px;border-radius:2px;display:inline-block}
+tr.amz-row{background:var(--amz-light)}
+tr.amz-row td:first-child{box-shadow:inset 3px 0 0 var(--amz)}
+.amz-chip{display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:0.5px;background:var(--amz);color:#fff;border-radius:3px;padding:1px 4px;margin-left:6px;vertical-align:1px}
 .modal-header{padding:18px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--surface)}
 .modal-body{padding:22px}.modal-footer{padding:14px 22px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px;position:sticky;bottom:0;background:var(--surface)}
 .toast-wrap{position:fixed;bottom:20px;right:20px;z-index:2000;display:flex;flex-direction:column;gap:6px}
@@ -151,7 +154,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
       <input type="text" id="forecast-search" placeholder="Search SKU or name..." style="width:240px" oninput="renderForecastTable()">
       <select id="forecast-series" onchange="renderForecastTable()" style="width:130px"><option value="all">All series</option></select>
       <select id="forecast-filter" onchange="renderForecastTable()" style="width:150px">
-        <option value="all">All SKUs</option><option value="critical">Order now</option><option value="warn">Reorder soon</option><option value="ok">Healthy</option><option value="stockout">Stockout corrected</option>
+        <option value="all">All SKUs</option><option value="critical">Order now</option><option value="warn">Reorder soon</option><option value="ok">Healthy</option><option value="stockout">Stockout corrected</option><option value="amazon">Amazon SKUs</option><option value="noamazon">Non-Amazon SKUs</option>
       </select>
     </div>
     <div class="flex">
@@ -178,7 +181,6 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
           <th onclick="sortForecast('minShelf')" style="cursor:pointer"><span id="fsh-minShelf">Min Shelf</span></th>
           <th onclick="sortForecast('daysLeft')" style="cursor:pointer"><span id="fsh-daysLeft">Days Left &#9650;</span></th>
           <th onclick="sortForecast('orderQty')" style="cursor:pointer"><span id="fsh-orderQty">Order Qty</span></th>
-          <th onclick="sortForecast('stdOrderQty')" style="cursor:pointer" title="What the textbook periodic-review (R,S) formula would order: demand over (lead + reorder cycle) counted once, with safety stock over that same interval. Evaluation only -- this does not affect the PO export."><span id="fsh-stdOrderQty">Standard (R,S)</span></th>
           <th title="Enter a quantity here to override the forecast on the PO export. Leave blank to use the forecast."><span>PO Override</span></th>
           <th onclick="sortForecast('status')" style="cursor:pointer"><span id="fsh-status">Status</span></th>
           <th></th>
@@ -315,6 +317,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0
     <div class="form-row">
       <div class="field"><label>Apply Seasonality Weighting</label><select id="m-seasonal"><option value="Yes">Yes</option><option value="No">No</option></select></div>
       <div class="field"><label>Active</label><select id="m-active"><option value="Yes">Yes</option><option value="No">No -- hide from forecasts</option></select></div>
+      <div class="field"><label>Sold on Amazon</label><select id="m-amazon"><option value="No">No</option><option value="Yes">Yes -- highlight in forecast</option></select></div>
     </div>
     <div class="form-row"><div class="field"><label>Series</label><input type="text" id="m-series" placeholder="e.g. GDS, ZLP, HWP"></div><div class="field"><label>Notes</label><textarea id="m-notes" rows="2" style="resize:vertical"></textarea></div></div>
   </div>
@@ -614,7 +617,8 @@ async function loadSKUs() {
     minShelf:parseInt(f.MinShelfLevel)||0, maxShelf:parseInt(f.MAxShelfLevel)||0,
     serviceLevel:parseFloat(f.ServiceLevel)||0.95, lookback:parseInt(f.LookbackMonths)||24,
     seasonal:f.ApplySeasonality===true||f.ApplySeasonality==='Yes', model:f.ForecastModel||'Auto',
-    growth:parseFloat(f.ExpectedGrowthPct)||0, active:f.IsActive===true||f.IsActive==='Yes', notes:f.Notes||'', series:f.Series||''
+    growth:parseFloat(f.ExpectedGrowthPct)||0, active:f.IsActive===true||f.IsActive==='Yes', notes:f.Notes||'', series:f.Series||'',
+    amazon:f.IsAmazon===true||f.IsAmazon==='Yes'
   })).filter(s=>s.active);
 }
 
@@ -845,8 +849,7 @@ function calcForecast(sku) {
 
   if (!skuOrds.length) return {
     avgDaily:0, forecastDemand:0, bufferStock:0, reorderPoint:Math.max(sku.minShelf,0),
-    reorderPeriodDemand:0, orderQty:0, daysLeft:999, status:'ok', leadDemand:0, modelUsed:'No data',
-    stdOrderQty:0, stdBufferStock:0
+    reorderPeriodDemand:0, orderQty:0, daysLeft:999, status:'ok', leadDemand:0, modelUsed:'No data'
   };
 
   // Run stockout detection and filter affected days from fast-moving SKUs
@@ -917,18 +920,6 @@ function calcForecast(sku) {
   const totalAvail = Math.max(0, sku.soh) + sku.soo;
   const daysLeft = avgDaily > 0 ? Math.round(totalAvail / avgDaily) : 999;
 
-  // --- Textbook periodic-review (R,S) comparison -------------------------
-  // Protection interval is (lead + freq) counted ONCE, and safety stock
-  // covers that same interval rather than lead time alone. Evaluation only:
-  // nothing downstream consumes stdOrderQty, so the live figure is unchanged.
-  const stdBufferStock = Math.round(z * stdDev * Math.sqrt(sku.lead + sku.freq));
-  const stdTarget = Math.round(avgDaily * (sku.lead + sku.freq)) + stdBufferStock + sku.minShelf;
-  let stdRaw = stdTarget - Math.max(0, sku.soh) - sku.soo;
-  stdRaw = Math.max(stdRaw, 0);
-  stdRaw = Math.max(stdRaw, sku.minQty);
-  if (sku.batch > 1 && stdRaw > 0) stdRaw = Math.ceil(stdRaw / sku.batch) * sku.batch;
-  const stdOrderQty = Math.round(stdRaw);
-  // ----------------------------------------------------------------------
 
   // StockTrim-matched order quantity formula
   let rawQty = forecastDemand + bufferStock - Math.max(0,sku.soh) - sku.soo + sku.minShelf + reorderPeriodDemand;
@@ -942,8 +933,7 @@ function calcForecast(sku) {
   else if (sku.soh <= reorderPoint || daysLeft <= (sku.lead + sku.freq)) status = 'warn';
 
   return { avgDaily:Math.round(avgDaily*100)/100, forecastDemand, bufferStock, reorderPoint,
-    reorderPeriodDemand, orderQty, daysLeft, status, leadDemand, modelUsed, stockoutDaysDetected,
-    stdOrderQty, stdBufferStock };
+    reorderPeriodDemand, orderQty, daysLeft, status, leadDemand, modelUsed, stockoutDaysDetected };
 }
 function recalcAll(){
   forecast=skus.map(s=>({sku:s,...calcForecast(s)}));
@@ -1002,13 +992,13 @@ function sortForecast(col){
   } else {
     forecastSort.col=col;
     // Numeric columns default desc, text columns default asc
-    const numCols=['soh','soo','avgDaily','lead','forecastDemand','bufferStock','reorderPoint','minShelf','daysLeft','orderQty','stdOrderQty'];
+    const numCols=['soh','soo','avgDaily','lead','forecastDemand','bufferStock','reorderPoint','minShelf','daysLeft','orderQty'];
     forecastSort.dir=numCols.includes(col)?'desc':'asc';
   }
   // Update header indicators
   const cols={code:'Code',name:'Name',series:'Series',soh:'On Hand',soo:'On Order',
     avgDaily:'Avg Daily',model:'Model',lead:'Lead Time',forecastDemand:'Forecast Demand',
-    bufferStock:'Buffer Stock',reorderPoint:'Reorder Point',minShelf:'Min Shelf',stdOrderQty:'Standard (R,S)',
+    bufferStock:'Buffer Stock',reorderPoint:'Reorder Point',minShelf:'Min Shelf',
     daysLeft:'Days Left',orderQty:'Order Qty',status:'Status'};
   Object.keys(cols).forEach(c=>{
     const el=document.getElementById('fsh-'+c);
@@ -1025,6 +1015,8 @@ function renderForecastTable(){
   const rows=forecast.filter(r=>{
     if(s&&!r.sku.code.toLowerCase().includes(s)&&!r.sku.name.toLowerCase().includes(s))return false;
     if(f==='stockout'){if(!r.stockoutDaysDetected||r.stockoutDaysDetected===0)return false;}
+    else if(f==='amazon'){if(!r.sku.amazon)return false;}
+    else if(f==='noamazon'){if(r.sku.amazon)return false;}
     else if(f!=='all'&&r.status!==f)return false;
     if(ser!=='all'&&r.sku.series!==ser)return false;
     return true;
@@ -1053,8 +1045,8 @@ function renderForecastTable(){
     if(typeof av==='string') return av.localeCompare(bv)*dir;
     return (av-bv)*dir;
   });
-  document.getElementById('forecast-table').innerHTML=rows.map(f=>`<tr>
-    <td><span class="sku-code">${f.sku.code}</span></td>
+  document.getElementById('forecast-table').innerHTML=rows.map(f=>`<tr${f.sku.amazon?' class="amz-row"':''}>
+    <td><span class="sku-code">${f.sku.code}</span>${f.sku.amazon?'<span class="amz-chip" title="Sold on Amazon">AMZ</span>':''}</td>
     <td style="max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.sku.name}">${f.sku.name}</td>
     <td>${f.sku.series||'--'}</td>
     <td>${Math.max(0,f.sku.soh).toLocaleString()}</td><td>${f.sku.soo.toLocaleString()}</td>
@@ -1064,11 +1056,10 @@ function renderForecastTable(){
     <td>${f.sku.minShelf.toLocaleString()}</td>
     <td><span class="badge ${f.daysLeft<=f.sku.lead?'badge-danger':f.daysLeft<=21?'badge-warn':'badge-ok'}">${f.daysLeft>=999?'>365':f.daysLeft+'d'}</span></td>
     <td style="font-weight:700;color:${f.orderQty>0?'var(--brand)':'var(--text-3)'}">${f.orderQty>0?f.orderQty.toLocaleString():'--'}</td>
-    <td style="white-space:nowrap">${(f.orderQty>0||f.stdOrderQty>0)?`<span style="font-weight:600">${f.stdOrderQty.toLocaleString()}</span>${f.stdOrderQty!==f.orderQty?` <span style="font-size:11px;color:${f.stdOrderQty<f.orderQty?'var(--danger)':'var(--ok)'}">${f.stdOrderQty<f.orderQty?'\u2212':'+'}${Math.abs(f.stdOrderQty-f.orderQty).toLocaleString()}</span>`:''}`:'<span class="text-muted">--</span>'}</td>
     <td><input type="number" min="0" step="1" class="po-ovr${poOverrides[f.sku.code]!==undefined?' set':''}" value="${poOverrides[f.sku.code]!==undefined?poOverrides[f.sku.code]:''}" placeholder="${f.orderQty>0?f.orderQty:'--'}" onchange="setPOOverride('${f.sku.code}',this.value)"></td>
     <td>${f.status==='critical'?'<span class="badge badge-danger">Order now</span>':f.status==='warn'?'<span class="badge badge-warn">Reorder soon</span>':'<span class="badge badge-ok">Healthy</span>'}</td>
     <td style="white-space:nowrap"><button class="btn-sm" onclick="openHistoryModal('${f.sku.code}')">History</button> <button class="btn-sm" onclick="openSKUModal('${f.sku.code}')">Settings</button></td>
-  </tr>`).join('')||'<tr><td colspan="18" class="text-muted" style="padding:20px;text-align:center">No results</td></tr>';
+  </tr>`).join('')||'<tr><td colspan="17" class="text-muted" style="padding:20px;text-align:center">No results</td></tr>';
   updateOverrideBadge();
 }
 
@@ -1310,7 +1301,7 @@ function openSKUModal(code){
   document.getElementById('m-minqty').value=s?s.minQty:0; document.getElementById('m-minshelf').value=s?s.minShelf:0; document.getElementById('m-maxshelf').value=s&&s.maxShelf?s.maxShelf:'';
   document.getElementById('m-service').value=s?s.serviceLevel:0.95; document.getElementById('m-lookback').value=s?s.lookback:24;
   document.getElementById('m-model').value=s?s.model:'Auto'; document.getElementById('m-growth').value=s?s.growth:0;
-  document.getElementById('m-seasonal').value=s&&!s.seasonal?'No':'Yes'; document.getElementById('m-active').value=s&&!s.active?'No':'Yes';
+  document.getElementById('m-seasonal').value=s&&!s.seasonal?'No':'Yes'; document.getElementById('m-active').value=s&&!s.active?'No':'Yes'; document.getElementById('m-amazon').value=s&&s.amazon?'Yes':'No';
   document.getElementById('m-series').value=s?s.series:'';
   document.getElementById('m-notes').value=s?s.notes:'';
   document.getElementById('sku-modal').classList.remove('hidden');
@@ -1640,16 +1631,6 @@ function histCalcPanel(f){
         <span style="font-weight:700;font-size:20px;color:var(--brand);font-variant-numeric:tabular-nums">${f.orderQty.toLocaleString()}</span>
       </div>
       ${mismatch?`<div class="alert alert-warn" style="margin-top:10px">This breakdown totals ${afterBatch.toLocaleString()} but the forecast reports ${f.orderQty.toLocaleString()}. Treat the forecast value as authoritative and report this discrepancy.</div>`:''}
-      ${f.stdOrderQty!==undefined?`
-      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">
-        <div style="display:flex;justify-content:space-between;align-items:baseline">
-          <span style="font-size:13px;color:var(--text-2)">Standard periodic-review (R,S) formula would order</span>
-          <span style="font-weight:700;font-size:15px;font-variant-numeric:tabular-nums;color:${f.stdOrderQty<f.orderQty?'var(--danger)':f.stdOrderQty>f.orderQty?'var(--ok)':'var(--text)'}">${f.stdOrderQty.toLocaleString()}${f.stdOrderQty!==f.orderQty?` (${f.stdOrderQty<f.orderQty?'\u2212':'+'}${Math.abs(f.stdOrderQty-f.orderQty).toLocaleString()})`:''}</span>
-        </div>
-        <div class="text-muted" style="font-size:11.5px;margin-top:5px">
-          Counts the ${s.lead + s.freq}-day protection interval once instead of adding the ${s.freq}-day reorder period twice, and sizes buffer stock over the full interval (${f.stdBufferStock} vs ${f.bufferStock}). Shown for comparison only &mdash; the PO export uses the figure above.
-        </div>
-      </div>`:''}
       ${poOverrides[s.code]!==undefined?`<div class="alert alert-info" style="margin-top:10px">A PO override of <strong>${poOverrides[s.code].toLocaleString()}</strong> is set for this SKU, so the export will use that instead.</div>`:''}
     </div>
   </div>`;
@@ -1756,30 +1737,39 @@ async function saveSKU(){
   const id=document.getElementById('m-id').value;
   const code=document.getElementById('m-code').value.trim();
   if(!code)return showToast('Product code is required','err');
-  const data={code,name:document.getElementById('m-name').value.trim(),soh:parseFloat(document.getElementById('m-soh').value)||0,soo:parseFloat(document.getElementById('m-soo').value)||0,cost:parseFloat(document.getElementById('m-cost').value)||0,lead:parseInt(document.getElementById('m-lead').value)||12,batch:parseInt(document.getElementById('m-batch').value)||1,freq:parseInt(document.getElementById('m-freq').value)||7,minQty:parseInt(document.getElementById('m-minqty').value)||0,minShelf:parseInt(document.getElementById('m-minshelf').value)||0,maxShelf:parseInt(document.getElementById('m-maxshelf').value)||0,serviceLevel:parseFloat(document.getElementById('m-service').value)||0.95,lookback:parseInt(document.getElementById('m-lookback').value)||24,model:document.getElementById('m-model').value,growth:parseFloat(document.getElementById('m-growth').value)||0,seasonal:document.getElementById('m-seasonal').value!=='No',active:document.getElementById('m-active').value!=='No',notes:document.getElementById('m-notes').value,series:document.getElementById('m-series').value.trim()};
-  const fields={Title:data.code,ProductName:data.name,StockOnHand:data.soh,StockOnOrder:data.soo,Cost:data.cost,LeadTimeDays:data.lead,BatchSize:data.batch,ReorderFrequencyDays:data.freq,MinOrderQty:data.minQty,MinShelfLevel:data.minShelf,MAxShelfLevel:data.maxShelf||null,ServiceLevel:data.serviceLevel,LookbackMonths:data.lookback,ForecastModel:data.model,ExpectedGrowthPct:data.growth,ApplySeasonality:data.seasonal?true:false,IsActive:data.active?true:false,Notes:data.notes,Series:data.series};
+  const data={code,name:document.getElementById('m-name').value.trim(),soh:parseFloat(document.getElementById('m-soh').value)||0,soo:parseFloat(document.getElementById('m-soo').value)||0,cost:parseFloat(document.getElementById('m-cost').value)||0,lead:parseInt(document.getElementById('m-lead').value)||12,batch:parseInt(document.getElementById('m-batch').value)||1,freq:parseInt(document.getElementById('m-freq').value)||7,minQty:parseInt(document.getElementById('m-minqty').value)||0,minShelf:parseInt(document.getElementById('m-minshelf').value)||0,maxShelf:parseInt(document.getElementById('m-maxshelf').value)||0,serviceLevel:parseFloat(document.getElementById('m-service').value)||0.95,lookback:parseInt(document.getElementById('m-lookback').value)||24,model:document.getElementById('m-model').value,growth:parseFloat(document.getElementById('m-growth').value)||0,seasonal:document.getElementById('m-seasonal').value!=='No',active:document.getElementById('m-active').value!=='No',amazon:document.getElementById('m-amazon').value==='Yes',notes:document.getElementById('m-notes').value,series:document.getElementById('m-series').value.trim()};
+  const fields={Title:data.code,ProductName:data.name,StockOnHand:data.soh,StockOnOrder:data.soo,Cost:data.cost,LeadTimeDays:data.lead,BatchSize:data.batch,ReorderFrequencyDays:data.freq,MinOrderQty:data.minQty,MinShelfLevel:data.minShelf,MAxShelfLevel:data.maxShelf||null,ServiceLevel:data.serviceLevel,LookbackMonths:data.lookback,ForecastModel:data.model,ExpectedGrowthPct:data.growth,ApplySeasonality:data.seasonal?true:false,IsActive:data.active?true:false,Notes:data.notes,Series:data.series,IsAmazon:data.amazon?true:false};
+  // IsAmazon is a newer column. If it does not exist in ForecastSKUs yet the
+  // write is rejected, so retry without it rather than failing the whole save.
+  let amzDropped=false;
+  const write=async(fl)=> id ? updateListItem(LISTS.skus,id,fl) : addListItem(LISTS.skus,fl);
   try{
-    if(id) await updateListItem(LISTS.skus,id,fields);
-    else await addListItem(LISTS.skus,fields);
+    try{
+      await write(fields);
+    }catch(e1){
+      if(!/IsAmazon/i.test(e1.message||'')) throw e1;
+      const {IsAmazon, ...withoutAmz}=fields;
+      await write(withoutAmz);
+      amzDropped=true;
+    }
   }catch(e){return showToast('Save failed: '+e.message,'err');}
   if(id){const s=skus.find(x=>x.id==id);if(s)Object.assign(s,data);}else skus.push({id:Date.now(),...data});
+  if(amzDropped) data.amazon=false;
   closeSKUModal();recalcAll();renderDashboard();renderForecastTable();renderSKUsTable();
-  showToast('SKU settings saved','ok');
+  if(amzDropped) showToast("Saved, but the Amazon flag needs an 'IsAmazon' Yes/No column added to the ForecastSKUs list",'warn');
+  else showToast('SKU settings saved','ok');
 }
 
 // ============================================================
 // EXPORT
 // ============================================================
 function exportForecast(){
-  const rows=[['Code','Name','On Hand','On Order','Avg Daily Sales','Lead Time (days)','Reorder Cycle (days)','Forecast Demand','Buffer Stock','Reorder Point','Days Left','Order Qty','Standard (R,S) Qty','Delta','Delta %','Cycle Share R/(L+R)','Status','Unit Cost','Order Value ($)','Standard Value ($)']];
+  const rows=[['Code','Name','On Hand','On Order','Avg Daily Sales','Lead Time (days)','Reorder Cycle (days)','Forecast Demand','Buffer Stock','Reorder Point','Days Left','Order Qty','Status','Unit Cost','Order Value ($)']];
   forecast.filter(f=>f.orderQty>0||f.status!=='ok').sort((a,b)=>{const o={critical:0,warn:1,ok:2};return(o[a.status]||3)-(o[b.status]||3);}).forEach(f=>{
-    const delta=f.stdOrderQty-f.orderQty;
-    const deltaPct=f.orderQty>0?Math.round(delta/f.orderQty*1000)/10:'';
-    const share=Math.round(f.sku.freq/(f.sku.lead+f.sku.freq)*1000)/1000;
-    rows.push([f.sku.code,f.sku.name,Math.max(0,f.sku.soh),f.sku.soo,f.avgDaily,f.sku.lead,f.sku.freq,f.forecastDemand,f.bufferStock,f.reorderPoint,f.daysLeft>=999?'>365':f.daysLeft,f.orderQty,f.stdOrderQty,delta,deltaPct,share,f.status==='critical'?'Order now':f.status==='warn'?'Reorder soon':'Healthy',f.sku.cost,Math.round(f.orderQty*f.sku.cost*100)/100,Math.round(f.stdOrderQty*f.sku.cost*100)/100]);
+    rows.push([f.sku.code,f.sku.name,Math.max(0,f.sku.soh),f.sku.soo,f.avgDaily,f.sku.lead,f.sku.freq,f.forecastDemand,f.bufferStock,f.reorderPoint,f.daysLeft>=999?'>365':f.daysLeft,f.orderQty,f.status==='critical'?'Order now':f.status==='warn'?'Reorder soon':'Healthy',f.sku.cost,Math.round(f.orderQty*f.sku.cost*100)/100]);
   });
   const ws=XLSX.utils.aoa_to_sheet(rows);
-  ws['!cols']=[{wch:18},{wch:42},{wch:10},{wch:10},{wch:14},{wch:14},{wch:16},{wch:16},{wch:13},{wch:14},{wch:10},{wch:10},{wch:16},{wch:9},{wch:9},{wch:18},{wch:13},{wch:10},{wch:14},{wch:16}];
+  ws['!cols']=[{wch:18},{wch:42},{wch:10},{wch:10},{wch:14},{wch:14},{wch:16},{wch:16},{wch:13},{wch:14},{wch:10},{wch:10},{wch:13},{wch:10},{wch:14}];
   const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Forecast '+new Date().toISOString().substring(0,10));
   XLSX.writeFile(wb,'Forecast_'+new Date().toISOString().substring(0,10)+'.xlsx');
   showToast('Exported to Excel','ok');
