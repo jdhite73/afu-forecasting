@@ -1089,17 +1089,19 @@ async function upsertStock(records){
   let done=0,succeeded=0,failed=0;
   const errors=[];
   for(const r of records){
+    let createdSku=null;
     try{
       try{await addListItem(LISTS.snapshots,{Title:r.code,SnapshotDate:snap,StockOnHand:r.soh,StockOnOrder:r.soo,Cost:r.cost});}catch(e){console.warn('Snapshot error',r.code,e);}
       const existItemId=await getItemIdByTitle(LISTS.skus,r.code);
       if(existItemId){
         const upd={StockOnHand:r.soh,StockOnOrder:r.soo,Cost:r.cost};if(r.maxShelf!==null)upd.MAxShelfLevel=r.maxShelf;await updateListItem(LISTS.skus,existItemId,upd);
+        createdSku=null;
       } else {
-        const newSku={Title:r.code,ProductName:r.name,StockOnHand:r.soh,StockOnOrder:r.soo,Cost:r.cost,LeadTimeDays:12,BatchSize:1,ReorderFrequencyDays:7,ServiceLevel:0.95,LookbackMonths:24,IsActive:true,ForecastModel:'Auto',ApplySeasonality:true};if(r.maxShelf!==null)newSku.MAxShelfLevel=r.maxShelf;await addListItem(LISTS.skus,newSku);
+        const newSku={Title:r.code,ProductName:r.name,StockOnHand:r.soh,StockOnOrder:r.soo,Cost:r.cost,LeadTimeDays:12,BatchSize:1,ReorderFrequencyDays:7,ServiceLevel:0.95,LookbackMonths:24,IsActive:true,ForecastModel:'Auto',ApplySeasonality:true};if(r.maxShelf!==null)newSku.MAxShelfLevel=r.maxShelf;createdSku=await addListItem(LISTS.skus,newSku);
       }
       const s=skus.find(x=>x.code===r.code);
       if(s){s.soh=r.soh;s.soo=r.soo;s.cost=r.cost;}
-      else skus.push({id:null,code:r.code,name:r.name,soh:r.soh,soo:r.soo,cost:r.cost,lead:12,freq:7,minQty:0,batch:1,minShelf:0,maxShelf:0,serviceLevel:0.95,lookback:24,seasonal:true,model:'Auto',growth:0,active:true,notes:'',series:''});
+      else skus.push({id:(createdSku&&createdSku.id)||null,code:r.code,name:r.name,soh:r.soh,soo:r.soo,cost:r.cost,lead:12,freq:7,minQty:0,batch:1,minShelf:0,maxShelf:0,serviceLevel:0.95,lookback:24,seasonal:true,model:'Auto',growth:0,active:true,notes:'',series:''});
       succeeded++;
     }catch(e){
       failed++;
@@ -1176,8 +1178,12 @@ async function writeOrders(records){
   const errors=[];
   for(const r of newRecs){
     try{
-      await addListItem(LISTS.orders,{Title:r.orderNum+'|'+r.sku,OrderDate:r.date?r.date.substring(0,10)+'T00:00:00Z':new Date().toISOString().substring(0,10)+'T00:00:00Z',SKU:r.sku,Channel:r.channel,QtySold:r.qtySold,QtyReturned:r.qtyReturned,IsExcluded:r.excluded?true:false,ImportedDate:new Date().toISOString()});
-      orders.push({id:null,...r});
+      const created=await addListItem(LISTS.orders,{Title:r.orderNum+'|'+r.sku,OrderDate:r.date?r.date.substring(0,10)+'T00:00:00Z':new Date().toISOString().substring(0,10)+'T00:00:00Z',SKU:r.sku,Channel:r.channel,QtySold:r.qtySold,QtyReturned:r.qtyReturned,IsExcluded:r.excluded?true:false,ImportedDate:new Date().toISOString()});
+      // Keep the real SharePoint item id: toggleExclude() patches by it, and a
+      // null id makes the Exclude button silently do nothing until a reload.
+      // Title is stored as "orderNum|sku", so mirror that for orderNum too or
+      // imported rows display differently from reloaded ones.
+      orders.push({...r, id:(created&&created.id)||null, orderNum:r.orderNum+'|'+r.sku});
       succeeded++;
     }catch(e){
       failed++;
@@ -1263,10 +1269,16 @@ function renderOrdersTable(){
 }
 
 async function toggleExclude(id,orderNum){
-  const o=orders.find(x=>x.id==id);if(!o)return;
+  // Never fail silently here: a row whose id did not survive its import used
+  // to hit a bare `return`, so the button did nothing with no explanation.
+  if(id===null||id===undefined||id===''||id==='null'||id==='undefined'){
+    return showToast('This order has no SharePoint id yet -- reload the app, then exclude it','err');
+  }
+  const o=orders.find(x=>String(x.id)===String(id));
+  if(!o) return showToast('Could not find that order in memory -- try reloading the app','err');
   o.excluded=!o.excluded;
   try{await updateListItem(LISTS.orders,id,{IsExcluded:o.excluded?true:false});}
-  catch(e){showToast('Update failed','err');o.excluded=!o.excluded;return;}
+  catch(e){showToast('Update failed: '+e.message,'err');o.excluded=!o.excluded;renderOrdersTable();return;}
   recalcAll();renderOrdersTable();renderForecastTable();renderDashboard();
   showToast(orderNum+(o.excluded?' excluded from':' included in')+' forecast','ok');
 }
@@ -1742,7 +1754,8 @@ async function saveSKU(){
   // IsAmazon is a newer column. If it does not exist in ForecastSKUs yet the
   // write is rejected, so retry without it rather than failing the whole save.
   let amzDropped=false;
-  const write=async(fl)=> id ? updateListItem(LISTS.skus,id,fl) : addListItem(LISTS.skus,fl);
+  let createdItem=null;
+  const write=async(fl)=>{ const res = id ? await updateListItem(LISTS.skus,id,fl) : await addListItem(LISTS.skus,fl); if(!id) createdItem=res; return res; };
   try{
     try{
       await write(fields);
@@ -1753,7 +1766,10 @@ async function saveSKU(){
       amzDropped=true;
     }
   }catch(e){return showToast('Save failed: '+e.message,'err');}
-  if(id){const s=skus.find(x=>x.id==id);if(s)Object.assign(s,data);}else skus.push({id:Date.now(),...data});
+  // A new SKU must take the id SharePoint assigned, not an invented one, or
+  // editing it again in the same session patches an item that does not exist.
+  if(id){const s=skus.find(x=>x.id==id);if(s)Object.assign(s,data);}
+  else skus.push({id:(createdItem&&createdItem.id)||null,...data});
   if(amzDropped) data.amazon=false;
   closeSKUModal();recalcAll();renderDashboard();renderForecastTable();renderSKUsTable();
   if(amzDropped) showToast("Saved, but the Amazon flag needs an 'IsAmazon' Yes/No column added to the ForecastSKUs list",'warn');
