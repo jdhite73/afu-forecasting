@@ -165,6 +165,7 @@ tr.amz-row td:first-child{box-shadow:inset 3px 0 0 var(--amz)}
       <button class="btn-primary" onclick="exportPO()">&#8595; PO Export</button>
     </div>
   </div>
+  <div id="po-draft-bar" class="alert alert-info hidden" style="margin-top:12px"></div>
   <div class="card"><div class="table-wrap">
     <table><thead><tr>
           <th onclick="sortForecast('code')" style="cursor:pointer"><span id="fsh-code">Code</span></th>
@@ -451,6 +452,7 @@ async function onSignedIn(account) {
     renderDashboard();
     renderForecastTable();
     renderSKUsTable();
+    showPODraftBar();
     setBadge('ok','Connected');
     document.getElementById('last-sync').textContent = 'Synced ' + new Date().toLocaleTimeString();
   } catch(e) {
@@ -1008,6 +1010,30 @@ function sortForecast(col){
   renderForecastTable();
 }
 
+// A blank table used to say only "No results", which looks like the app broke.
+// Name the filters doing it and offer a one-click reset, so nobody reaches for
+// a page refresh and loses their in-progress PO overrides.
+function emptyForecastRow(search,status,series){
+  const bits=[];
+  if(search) bits.push(`search "${search}"`);
+  if(status!=='all'){
+    const labels={critical:'Order now',warn:'Reorder soon',ok:'Healthy',stockout:'Stockout corrected',amazon:'Amazon SKUs',noamazon:'Non-Amazon SKUs'};
+    bits.push('filter "'+(labels[status]||status)+'"');
+  }
+  if(series!=='all') bits.push('series "'+series+'"');
+  const msg = bits.length
+    ? `No SKUs match ${bits.join(' + ')}. <button class="btn-sm" style="margin-left:8px" onclick="clearForecastFilters()">Clear filters</button>`
+    : 'No SKUs loaded. Import a stock file from the Import Data tab.';
+  return `<tr><td colspan="17" class="text-muted" style="padding:22px;text-align:center">${msg}</td></tr>`;
+}
+
+function clearForecastFilters(){
+  document.getElementById('forecast-search').value='';
+  document.getElementById('forecast-filter').value='all';
+  document.getElementById('forecast-series').value='all';
+  renderForecastTable();
+}
+
 function renderForecastTable(){
   const s=document.getElementById('forecast-search').value.toLowerCase();
   const f=document.getElementById('forecast-filter').value;
@@ -1059,7 +1085,7 @@ function renderForecastTable(){
     <td><input type="number" min="0" step="1" class="po-ovr${poOverrides[f.sku.code]!==undefined?' set':''}" value="${poOverrides[f.sku.code]!==undefined?poOverrides[f.sku.code]:''}" placeholder="${f.orderQty>0?f.orderQty:'--'}" onchange="setPOOverride('${f.sku.code}',this.value)"></td>
     <td>${f.status==='critical'?'<span class="badge badge-danger">Order now</span>':f.status==='warn'?'<span class="badge badge-warn">Reorder soon</span>':'<span class="badge badge-ok">Healthy</span>'}</td>
     <td style="white-space:nowrap"><button class="btn-sm" onclick="openHistoryModal('${f.sku.code}')">History</button> <button class="btn-sm" onclick="openSKUModal('${f.sku.code}')">Settings</button></td>
-  </tr>`).join('')||'<tr><td colspan="17" class="text-muted" style="padding:20px;text-align:center">No results</td></tr>';
+  </tr>`).join('')||emptyForecastRow(s,f,ser);
   updateOverrideBadge();
 }
 
@@ -1794,6 +1820,71 @@ function exportForecast(){
 // ------------------------------------------------------------
 // PO QUANTITY OVERRIDES
 // ------------------------------------------------------------
+// ------------------------------------------------------------
+// OVERRIDE DRAFT
+// Overrides deliberately do not live in SharePoint -- a forgotten one would
+// silently distort a future PO. But losing an afternoon's work to a stray
+// refresh is its own problem. The compromise: keep a dated local draft that
+// is NEVER applied automatically. It is offered on load, with its age shown,
+// and cleared the moment a PO is exported.
+// ------------------------------------------------------------
+const PO_DRAFT_KEY='afu.poDraft.v1';
+const PO_DRAFT_MAX_AGE_MS=7*24*60*60*1000;
+
+function savePODraft(){
+  try{
+    if(!Object.keys(poOverrides).length){ localStorage.removeItem(PO_DRAFT_KEY); return; }
+    localStorage.setItem(PO_DRAFT_KEY, JSON.stringify({ts:Date.now(), overrides:poOverrides}));
+  }catch(e){ /* storage blocked or full -- drafts are best effort, never load-bearing */ }
+}
+
+function readPODraft(){
+  try{
+    const raw=localStorage.getItem(PO_DRAFT_KEY);
+    if(!raw) return null;
+    const d=JSON.parse(raw);
+    if(!d||typeof d.ts!=='number'||!d.overrides) return null;
+    if(Date.now()-d.ts > PO_DRAFT_MAX_AGE_MS){ localStorage.removeItem(PO_DRAFT_KEY); return null; }
+    return Object.keys(d.overrides).length ? d : null;
+  }catch(e){ return null; }
+}
+
+function discardPODraft(){
+  try{ localStorage.removeItem(PO_DRAFT_KEY); }catch(e){}
+  const el=document.getElementById('po-draft-bar'); if(el) el.classList.add('hidden');
+}
+
+function restorePODraft(){
+  const d=readPODraft();
+  if(!d) return discardPODraft();
+  let applied=0, skipped=0;
+  Object.keys(d.overrides).forEach(code=>{
+    // Only restore SKUs still present, so a stale code cannot reappear silently.
+    if(skus.some(x=>x.code===code)){ poOverrides[code]=d.overrides[code]; applied++; }
+    else skipped++;
+  });
+  discardPODraft();
+  renderForecastTable();
+  showToast(applied+' override'+(applied===1?'':'s')+' restored'+(skipped?', '+skipped+' skipped (SKU no longer in the catalogue)':''), applied?'ok':'warn');
+}
+
+function showPODraftBar(){
+  const el=document.getElementById('po-draft-bar');
+  if(!el) return;
+  const d=readPODraft();
+  // Never offer a draft over the top of work already in progress.
+  if(!d || Object.keys(poOverrides).length){ el.classList.add('hidden'); return; }
+  const n=Object.keys(d.overrides).length;
+  const mins=Math.round((Date.now()-d.ts)/60000);
+  const age = mins<1 ? 'just now' : mins<60 ? mins+' min ago'
+            : mins<1440 ? Math.round(mins/60)+' hr ago'
+            : Math.round(mins/1440)+' day'+(Math.round(mins/1440)===1?'':'s')+' ago';
+  el.innerHTML=`<strong>${n} PO override${n===1?'':'s'}</strong> from ${new Date(d.ts).toLocaleString()} (${age}) were never exported.
+    <button class="btn-sm" style="margin-left:8px" onclick="restorePODraft()">Restore</button>
+    <button class="btn-sm" onclick="discardPODraft()">Discard</button>`;
+  el.classList.remove('hidden');
+}
+
 function setPOOverride(code,val){
   const v=String(val==null?'':val).trim();
   if(v===''){
@@ -1807,6 +1898,7 @@ function setPOOverride(code,val){
       poOverrides[code]=n;
     }
   }
+  savePODraft();
   renderForecastTable();
 }
 
@@ -1814,6 +1906,7 @@ function clearPOOverrides(){
   const n=Object.keys(poOverrides).length;
   if(!n){ showToast('No overrides to clear','ok'); return; }
   poOverrides={};
+  savePODraft();
   renderForecastTable();
   showToast(n+' override'+(n===1?'':'s')+' cleared','ok');
 }
@@ -1866,6 +1959,7 @@ function exportPO(){
   XLSX.utils.book_append_sheet(wb,ws,'Sheet1');
   XLSX.writeFile(wb,'SellerCloud_PO_'+new Date().toISOString().substring(0,10)+'.xlsx');
 
+  discardPODraft();
   const notes=[];
   if(overridden) notes.push(overridden+' overridden');
   if(noCost) notes.push(noCost+' with no unit cost');
