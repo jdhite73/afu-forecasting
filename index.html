@@ -179,7 +179,7 @@ tr.amz-row td:first-child{box-shadow:inset 3px 0 0 var(--amz)}
           <th onclick="sortForecast('forecastDemand')" style="cursor:pointer"><span id="fsh-forecastDemand">Forecast Demand</span></th>
           <th onclick="sortForecast('bufferStock')" style="cursor:pointer"><span id="fsh-bufferStock">Buffer Stock</span></th>
           <th onclick="sortForecast('reorderPoint')" style="cursor:pointer"><span id="fsh-reorderPoint">Reorder Point</span></th>
-          <th onclick="sortForecast('minShelf')" style="cursor:pointer"><span id="fsh-minShelf">Min Shelf</span></th>
+          <th onclick="sortForecast('last14')" style="cursor:pointer" title="Net units sold in the trailing 14 days. Excludes Wholesale and excluded orders, matching the forecast basis. Not stockout-corrected -- this is what actually shipped."><span id="fsh-last14">2wk Sales</span></th>
           <th onclick="sortForecast('daysLeft')" style="cursor:pointer"><span id="fsh-daysLeft">Days Left &#9650;</span></th>
           <th onclick="sortForecast('orderQty')" style="cursor:pointer"><span id="fsh-orderQty">Order Qty</span></th>
           <th title="Enter a quantity here to override the forecast on the PO export. Leave blank to use the forecast."><span>PO Override</span></th>
@@ -937,8 +937,26 @@ function calcForecast(sku) {
   return { avgDaily:Math.round(avgDaily*100)/100, forecastDemand, bufferStock, reorderPoint,
     reorderPeriodDemand, orderQty, daysLeft, status, leadDemand, modelUsed, stockoutDaysDetected };
 }
+// Net units sold per SKU over the trailing 14 days. Built in a single pass
+// over `orders` rather than re-scanning inside calcForecast for each SKU.
+// Same basis as the forecast (excluded orders and Wholesale left out) so the
+// figure is directly comparable to Avg Daily and Order Qty. Deliberately NOT
+// stockout-corrected: this is what actually shipped.
+function buildRecentSales(days){
+  const cutoff=new Date(); cutoff.setHours(0,0,0,0); cutoff.setDate(cutoff.getDate()-(days-1));
+  const from=cutoff.toISOString().substring(0,10);
+  const m=new Map();
+  for(const o of orders){
+    if(o.excluded||o.channel==='Wholesale') continue;
+    if(!o.date||o.date<from) continue;
+    m.set(o.sku,(m.get(o.sku)||0)+Math.max(0,o.qtySold-o.qtyReturned));
+  }
+  return m;
+}
+
 function recalcAll(){
-  forecast=skus.map(s=>({sku:s,...calcForecast(s)}));
+  const recent=buildRecentSales(14);
+  forecast=skus.map(s=>({sku:s,last14:recent.get(s.code)||0,...calcForecast(s)}));
   // Populate series dropdown
   const sel=document.getElementById('forecast-series');
   if(sel){
@@ -994,13 +1012,13 @@ function sortForecast(col){
   } else {
     forecastSort.col=col;
     // Numeric columns default desc, text columns default asc
-    const numCols=['soh','soo','avgDaily','lead','forecastDemand','bufferStock','reorderPoint','minShelf','daysLeft','orderQty'];
+    const numCols=['soh','soo','avgDaily','lead','forecastDemand','bufferStock','reorderPoint','last14','daysLeft','orderQty'];
     forecastSort.dir=numCols.includes(col)?'desc':'asc';
   }
   // Update header indicators
   const cols={code:'Code',name:'Name',series:'Series',soh:'On Hand',soo:'On Order',
     avgDaily:'Avg Daily',model:'Model',lead:'Lead Time',forecastDemand:'Forecast Demand',
-    bufferStock:'Buffer Stock',reorderPoint:'Reorder Point',minShelf:'Min Shelf',
+    bufferStock:'Buffer Stock',reorderPoint:'Reorder Point',last14:'2wk Sales',
     daysLeft:'Days Left',orderQty:'Order Qty',status:'Status'};
   Object.keys(cols).forEach(c=>{
     const el=document.getElementById('fsh-'+c);
@@ -1062,7 +1080,7 @@ function renderForecastTable(){
       case 'forecastDemand': av=a.forecastDemand; bv=b.forecastDemand; break;
       case 'bufferStock': av=a.bufferStock; bv=b.bufferStock; break;
       case 'reorderPoint': av=a.reorderPoint; bv=b.reorderPoint; break;
-      case 'minShelf': av=a.sku.minShelf; bv=b.sku.minShelf; break;
+      case 'last14': av=a.last14||0; bv=b.last14||0; break;
       case 'daysLeft': av=a.daysLeft; bv=b.daysLeft; break;
       case 'orderQty': av=a.orderQty; bv=b.orderQty; break;
       case 'status': const o={critical:0,warn:1,ok:2}; av=o[a.status]||3; bv=o[b.status]||3; break;
@@ -1079,7 +1097,7 @@ function renderForecastTable(){
     <td>${f.avgDaily}</td><td><span class="badge ${f.stockoutDaysDetected>0?'badge-warn':'badge-gray'}" style="font-size:10px" title="${f.stockoutDaysDetected>0?f.stockoutDaysDetected+' stockout days excluded':''}">${f.modelUsed||f.sku.model}</span></td><td>${f.sku.lead}d</td>
     <td>${f.forecastDemand.toLocaleString()}</td><td>${f.bufferStock.toLocaleString()}</td>
     <td>${f.reorderPoint.toLocaleString()}</td>
-    <td>${f.sku.minShelf.toLocaleString()}</td>
+    <td style="font-variant-numeric:tabular-nums">${f.last14?f.last14.toLocaleString():'<span class="text-muted">0</span>'}</td>
     <td><span class="badge ${f.daysLeft<=f.sku.lead?'badge-danger':f.daysLeft<=21?'badge-warn':'badge-ok'}">${f.daysLeft>=999?'>365':f.daysLeft+'d'}</span></td>
     <td style="font-weight:700;color:${f.orderQty>0?'var(--brand)':'var(--text-3)'}">${f.orderQty>0?f.orderQty.toLocaleString():'--'}</td>
     <td><input type="number" min="0" step="1" class="po-ovr${poOverrides[f.sku.code]!==undefined?' set':''}" value="${poOverrides[f.sku.code]!==undefined?poOverrides[f.sku.code]:''}" placeholder="${f.orderQty>0?f.orderQty:'--'}" onchange="setPOOverride('${f.sku.code}',this.value)"></td>
@@ -1658,6 +1676,7 @@ function histCalcPanel(f){
     <div style="padding:4px 14px 14px">
       <div style="display:flex;gap:22px;flex-wrap:wrap;font-size:12px;color:var(--text-2);padding:8px 0 12px;border-bottom:1px solid var(--border);margin-bottom:6px">
         <span><strong style="color:var(--text)">${f.avgDaily}</strong> avg units/day</span>
+        <span><strong style="color:var(--text)">${(f.last14||0).toLocaleString()}</strong> sold last 14 days</span>
         <span><strong style="color:var(--text)">${s.lead}</strong> day lead time</span>
         <span><strong style="color:var(--text)">${s.freq}</strong> day reorder cycle</span>
         <span><strong style="color:var(--text)">${s.soh.toLocaleString()}</strong> on hand</span>
@@ -1806,12 +1825,12 @@ async function saveSKU(){
 // EXPORT
 // ============================================================
 function exportForecast(){
-  const rows=[['Code','Name','On Hand','On Order','Avg Daily Sales','Lead Time (days)','Reorder Cycle (days)','Forecast Demand','Buffer Stock','Reorder Point','Days Left','Order Qty','Status','Unit Cost','Order Value ($)']];
+  const rows=[['Code','Name','On Hand','On Order','Avg Daily Sales','2wk Sales','Lead Time (days)','Reorder Cycle (days)','Forecast Demand','Buffer Stock','Reorder Point','Days Left','Order Qty','Status','Unit Cost','Order Value ($)']];
   forecast.filter(f=>f.orderQty>0||f.status!=='ok').sort((a,b)=>{const o={critical:0,warn:1,ok:2};return(o[a.status]||3)-(o[b.status]||3);}).forEach(f=>{
-    rows.push([f.sku.code,f.sku.name,Math.max(0,f.sku.soh),f.sku.soo,f.avgDaily,f.sku.lead,f.sku.freq,f.forecastDemand,f.bufferStock,f.reorderPoint,f.daysLeft>=999?'>365':f.daysLeft,f.orderQty,f.status==='critical'?'Order now':f.status==='warn'?'Reorder soon':'Healthy',f.sku.cost,Math.round(f.orderQty*f.sku.cost*100)/100]);
+    rows.push([f.sku.code,f.sku.name,Math.max(0,f.sku.soh),f.sku.soo,f.avgDaily,f.last14||0,f.sku.lead,f.sku.freq,f.forecastDemand,f.bufferStock,f.reorderPoint,f.daysLeft>=999?'>365':f.daysLeft,f.orderQty,f.status==='critical'?'Order now':f.status==='warn'?'Reorder soon':'Healthy',f.sku.cost,Math.round(f.orderQty*f.sku.cost*100)/100]);
   });
   const ws=XLSX.utils.aoa_to_sheet(rows);
-  ws['!cols']=[{wch:18},{wch:42},{wch:10},{wch:10},{wch:14},{wch:14},{wch:16},{wch:16},{wch:13},{wch:14},{wch:10},{wch:10},{wch:13},{wch:10},{wch:14}];
+  ws['!cols']=[{wch:18},{wch:42},{wch:10},{wch:10},{wch:14},{wch:11},{wch:14},{wch:16},{wch:16},{wch:13},{wch:14},{wch:10},{wch:10},{wch:13},{wch:10},{wch:14}];
   const wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,ws,'Forecast '+new Date().toISOString().substring(0,10));
   XLSX.writeFile(wb,'Forecast_'+new Date().toISOString().substring(0,10)+'.xlsx');
   showToast('Exported to Excel','ok');
