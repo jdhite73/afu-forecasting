@@ -109,6 +109,7 @@ tr.amz-row td:first-child{box-shadow:inset 3px 0 0 var(--amz)}
   <button class="nav-tab" onclick="showPage('import')">Import Data</button>
   <button class="nav-tab" onclick="showPage('orders')">Order History</button>
   <button class="nav-tab" onclick="showPage('skus')">SKU Settings</button>
+  <button class="nav-tab" onclick="showPage('polog')">PO Log</button>
 </div>
 <div class="main">
 
@@ -221,6 +222,10 @@ tr.amz-row td:first-child{box-shadow:inset 3px 0 0 var(--amz)}
     <div class="card-header"><span class="card-title">&#128337; Import Log</span></div>
     <div class="table-wrap"><table><thead><tr><th>Date / Time</th><th>Type</th><th>Records</th><th>Result</th></tr></thead><tbody id="import-log"><tr><td colspan="4" class="text-muted" style="padding:16px">No imports yet this session</td></tr></tbody></table></div>
   </div>
+  <div class="card" style="margin-top:16px">
+    <div class="card-header"><span class="card-title">PO Log</span><button class="btn-sm" onclick="refreshPOLogSetup()">Check status</button></div>
+    <div id="polog-setup" style="padding:4px 14px 14px"><div class="text-muted">Checking...</div></div>
+  </div>
 </div>
 
 <div class="page" id="page-orders">
@@ -255,6 +260,22 @@ tr.amz-row td:first-child{box-shadow:inset 3px 0 0 var(--amz)}
 </div></div>
 
 <!-- SKU MODAL -->
+<div class="page" id="page-polog">
+  <div class="flex-between">
+    <div class="text-muted" id="polog-summary">Every PO Export is recorded here with the forecast state behind it.</div>
+    <div class="flex">
+      <button onclick="renderPOLogPage(true)">&#8635; Refresh</button>
+      <button class="btn-primary" onclick="exportPOLog()">&#8595; Export Log to Excel</button>
+    </div>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <div class="table-wrap"><table><thead><tr>
+      <th>Run date</th><th>Run ID</th><th>Exported by</th><th>Lines</th><th>Overrides</th><th>Units</th><th>Value</th><th></th>
+    </tr></thead><tbody id="polog-runs"><tr><td colspan="8" class="text-muted" style="padding:20px;text-align:center">Open this tab to load the log.</td></tr></tbody></table></div>
+  </div>
+  <div id="polog-detail"></div>
+</div>
+
 <div class="modal-overlay hidden" id="hist-modal" onclick="if(event.target===this)closeHistModal()">
 <div class="modal modal-wide">
   <div class="modal-header">
@@ -340,7 +361,36 @@ const REDIRECT   = 'https://jdhite73.github.io/afu-forecasting';
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 const SP_HOST    = 'airfiltersunlimited.sharepoint.com';
 const SP_SITE_PATH = '/sites/BusinessOperations';
-const LISTS      = { skus:'ForecastSKUs', orders:'ForecastOrders', snapshots:'ForecastSnapshots' };
+const LISTS      = { skus:'ForecastSKUs', orders:'ForecastOrders', snapshots:'ForecastSnapshots', poLog:'ForecastPOLog' };
+
+// Single source of truth for the PO log list. Used both to create the list
+// automatically and to print manual setup instructions, so the two can never
+// disagree about a column name. Names are case-sensitive in SharePoint.
+// RunId, RunDate and SKU are indexed so filtering keeps working once the list
+// passes SharePoint's 5,000-item threshold (roughly a year of weekly runs).
+const PO_LOG_COLUMNS = [
+  {name:'RunId',         type:'text',     indexed:true, label:'Single line of text'},
+  {name:'RunDate',       type:'dateTime', indexed:true, label:'Date and Time'},
+  {name:'ExportedBy',    type:'text',                   label:'Single line of text'},
+  {name:'SKU',           type:'text',     indexed:true, label:'Single line of text'},
+  {name:'ForecastQty',   type:'number',                 label:'Number'},
+  {name:'OverrideQty',   type:'number',                 label:'Number'},
+  {name:'FinalQty',      type:'number',                 label:'Number'},
+  {name:'Overridden',    type:'boolean',                label:'Yes/No'},
+  {name:'UnitCost',      type:'number',                 label:'Number'},
+  {name:'AvgDaily',      type:'number',                 label:'Number'},
+  {name:'Sales14d',      type:'number',                 label:'Number'},
+  {name:'OnHand',        type:'number',                 label:'Number'},
+  {name:'OnOrder',       type:'number',                 label:'Number'},
+  {name:'LeadTime',      type:'number',                 label:'Number'},
+  {name:'ReorderCycle',  type:'number',                 label:'Number'},
+  {name:'BufferStock',   type:'number',                 label:'Number'},
+  {name:'MinShelf',      type:'number',                 label:'Number'},
+  {name:'ForecastModel', type:'text',                   label:'Single line of text'},
+  {name:'StockoutDays',  type:'number',                 label:'Number'},
+  {name:'DaysLeft',      type:'number',                 label:'Number'}
+];
+let currentUser = '';
 
 const msalConfig = {
   auth: { clientId:CLIENT_ID, authority:`https://login.microsoftonline.com/${TENANT_ID}`, redirectUri:REDIRECT },
@@ -440,7 +490,8 @@ async function getToken() {
 }
 
 async function onSignedIn(account) {
-  document.getElementById('user-name').textContent = account.name || account.username;
+  currentUser = account.name || account.username || '';
+  document.getElementById('user-name').textContent = currentUser;
   document.getElementById('signout-btn').classList.remove('hidden');
   setBadge('loading','Loading data...');
   try {
@@ -1840,6 +1891,298 @@ function exportForecast(){
 // PO QUANTITY OVERRIDES
 // ------------------------------------------------------------
 // ------------------------------------------------------------
+// PO LOG
+// Every PO export records each line with the state behind it, so a call can be
+// reviewed weeks later against what the app was actually looking at.
+// The Excel file is always written FIRST; logging happens afterwards and can
+// never delay or block a purchase order.
+// ------------------------------------------------------------
+let poLogRows = null;          // cached on first view of the PO Log tab
+let poLogWriting = false;      // guards against a double-click logging twice
+let poLogSelectedRun = null;
+
+function poLogColumnDef(c){
+  const d={name:c.name};
+  if(c.type==='text') d.text={};
+  else if(c.type==='number') d.number={};
+  else if(c.type==='dateTime') d.dateTime={format:'dateTime'};
+  else if(c.type==='boolean') d.boolean={};
+  if(c.indexed) d.indexed=true;
+  return d;
+}
+
+// Returns {exists, missing:[names]}. Checking columns, not just the list,
+// catches a manually-created list with a typo before a write fails on it.
+async function checkPOLog(){
+  let id;
+  try{ id=await lid(LISTS.poLog); }
+  catch(e){ return {exists:false, missing:PO_LOG_COLUMNS.map(c=>c.name)}; }
+  const cols=await graphReq('GET', `${GRAPH_BASE}/sites/${siteId}/lists/${id}/columns?$select=name`);
+  const have=new Set((cols.value||[]).map(c=>c.name));
+  return {exists:true, missing:PO_LOG_COLUMNS.filter(c=>!have.has(c.name)).map(c=>c.name)};
+}
+
+async function setupPOLog(){
+  const el=document.getElementById('polog-setup');
+  el.innerHTML='<div class="text-muted">Creating list...</div>';
+  try{
+    await graphReq('POST', `${GRAPH_BASE}/sites/${siteId}/lists`, {
+      displayName: LISTS.poLog,
+      columns: PO_LOG_COLUMNS.map(poLogColumnDef),
+      list: {template:'genericList'}
+    });
+    delete listIdCache[LISTS.poLog];
+    showToast('PO Log list created','ok');
+  }catch(e){
+    console.warn('PO log list creation failed:', e.message);
+    renderPOLogSetup({exists:false, missing:PO_LOG_COLUMNS.map(c=>c.name)}, e.message);
+    return;
+  }
+  renderPOLogSetup(await checkPOLog());
+}
+
+function renderPOLogSetup(status, createError){
+  const el=document.getElementById('polog-setup');
+  if(!el) return;
+  if(status.exists && !status.missing.length){
+    el.innerHTML=`<div class="alert alert-ok" style="margin:0">&#10003; The <strong>${LISTS.poLog}</strong> list is set up. Every PO Export is now logged.</div>`;
+    return;
+  }
+  const manual = `<table style="width:100%;font-size:12.5px;margin-top:10px;border-collapse:collapse">
+      <tr><th style="text-align:left;padding:4px 0">Column name (exact, case-sensitive)</th><th style="text-align:left">Type</th><th style="text-align:left">Indexed</th></tr>
+      ${PO_LOG_COLUMNS.filter(c=>status.missing.includes(c.name)).map(c=>`<tr><td style="padding:3px 0;font-family:ui-monospace,Menlo,monospace">${c.name}</td><td>${c.label}</td><td>${c.indexed?'Yes':''}</td></tr>`).join('')}
+    </table>`;
+  if(status.exists){
+    el.innerHTML=`<div class="alert alert-warn" style="margin:0">The <strong>${LISTS.poLog}</strong> list exists but is missing ${status.missing.length} column${status.missing.length===1?'':'s'}. Logging will fail until they are added.${manual}</div>`;
+    return;
+  }
+  el.innerHTML=`
+    <div class="text-muted" style="margin-bottom:10px">The PO log needs a SharePoint list called <strong>${LISTS.poLog}</strong>. The app can create it for you, with every column named and typed correctly.</div>
+    <button class="btn-primary" onclick="setupPOLog()">Create PO Log list</button>
+    ${createError?`<div class="alert alert-warn" style="margin-top:12px">Automatic creation was not permitted (${createError.substring(0,140)}). Create a list named <strong>${LISTS.poLog}</strong> in SharePoint with these columns, then reload:${manual}</div>`:''}`;
+}
+
+async function refreshPOLogSetup(){
+  const el=document.getElementById('polog-setup');
+  if(!el) return;
+  el.innerHTML='<div class="text-muted">Checking...</div>';
+  try{ renderPOLogSetup(await checkPOLog()); }
+  catch(e){ el.innerHTML=`<div class="alert alert-warn" style="margin:0">Could not check the PO log list: ${e.message}</div>`; }
+}
+
+// Snapshot everything needed SYNCHRONOUSLY, before any await, so a recalc or
+// override edit during the write cannot change what gets recorded.
+function buildPOLogRows(){
+  const now=new Date();
+  const pad=n=>String(n).padStart(2,'0');
+  const runId=`PO-${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  const runDate=now.toISOString();
+  const rows=[];
+  forecast.forEach(f=>{
+    const code=f.sku.code;
+    const ov=poOverrides[code];
+    const finalQty=poQty(f);
+    // Log what was ordered, plus anything deliberately overridden to zero --
+    // "we chose not to buy this" is a decision worth reviewing too. A zero
+    // override on a SKU the forecast already said 0 for is a no-op, not a call.
+    if(!(finalQty>0 || (ov===0 && f.orderQty>0))) return;
+    rows.push({
+      Title: runId+'|'+code,
+      RunId: runId, RunDate: runDate, ExportedBy: currentUser, SKU: code,
+      ForecastQty: f.orderQty,
+      OverrideQty: ov!==undefined ? ov : null,
+      FinalQty: finalQty,
+      Overridden: ov!==undefined && ov!==f.orderQty,
+      UnitCost: Math.round((f.sku.cost||0)*100)/100,
+      AvgDaily: f.avgDaily,
+      Sales14d: f.last14||0,
+      OnHand: Math.max(0,f.sku.soh),
+      OnOrder: f.sku.soo||0,
+      LeadTime: f.sku.lead,
+      ReorderCycle: f.sku.freq,
+      BufferStock: f.bufferStock,
+      MinShelf: f.sku.minShelf,
+      ForecastModel: f.modelUsed||'',
+      StockoutDays: f.stockoutDaysDetected||0,
+      DaysLeft: f.daysLeft>=999 ? null : f.daysLeft
+    });
+  });
+  return {runId, rows};
+}
+
+// Small worker pool: fast enough that ~100 lines take seconds, gentle enough
+// not to trip Graph throttling. 429/503 responses are retried with backoff.
+async function writePOLogRows(rows){
+  const fieldsOf=r=>{ const o={}; Object.keys(r).forEach(k=>{ if(r[k]!==null&&r[k]!==undefined) o[k]=r[k]; }); return o; };
+  let next=0, ok=0, fail=0, firstErr=null;
+  const worker=async()=>{
+    while(next<rows.length){
+      const r=rows[next++];
+      for(let attempt=0; attempt<4; attempt++){
+        try{ await addListItem(LISTS.poLog, fieldsOf(r)); ok++; break; }
+        catch(e){
+          const transient=/ (429|503|504):/.test(e.message||'');
+          if(transient && attempt<3){ await new Promise(res=>setTimeout(res, 800*Math.pow(2,attempt))); continue; }
+          fail++; if(!firstErr) firstErr=e.message; break;
+        }
+      }
+    }
+  };
+  await Promise.all(Array.from({length:Math.min(4,rows.length)}, worker));
+  return {ok, fail, firstErr};
+}
+
+async function logPORun(snapshot){
+  if(poLogWriting) return;
+  if(!snapshot.rows.length) return;
+  poLogWriting=true;
+  try{
+    const status=await checkPOLog();
+    if(!status.exists){
+      showToast('PO file exported. Not logged -- set up the PO Log on the Import Data tab','warn');
+      return;
+    }
+    if(status.missing.length){
+      showToast('PO file exported. Not logged -- the PO Log list is missing columns (see Import Data)','warn');
+      return;
+    }
+    const res=await writePOLogRows(snapshot.rows);
+    poLogRows=null; // force a fresh read next time the tab opens
+    if(res.fail) showToast(`PO logged with gaps: ${res.ok} of ${snapshot.rows.length} lines saved (${(res.firstErr||'').substring(0,80)})`,'err');
+    else showToast(`PO run logged -- ${res.ok} line${res.ok===1?'':'s'}`,'ok');
+  }catch(e){
+    showToast('PO file exported, but logging failed: '+e.message,'err');
+  }finally{
+    poLogWriting=false;
+  }
+}
+
+async function loadPOLog(force){
+  if(poLogRows && !force) return poLogRows;
+  const items=await getListItems(LISTS.poLog, null, null, null, 5000);
+  poLogRows=items.map(f=>({
+    runId:f.RunId||'', runDate:f.RunDate||'', by:f.ExportedBy||'', sku:f.SKU||'',
+    forecastQty:+f.ForecastQty||0,
+    overrideQty:(f.OverrideQty===undefined||f.OverrideQty===null)?null:+f.OverrideQty,
+    finalQty:+f.FinalQty||0,
+    overridden:f.Overridden===true||f.Overridden==='Yes',
+    cost:+f.UnitCost||0, avgDaily:+f.AvgDaily||0, sales14:+f.Sales14d||0,
+    onHand:+f.OnHand||0, onOrder:+f.OnOrder||0, lead:+f.LeadTime||0, cycle:+f.ReorderCycle||0,
+    buffer:+f.BufferStock||0, minShelf:+f.MinShelf||0, model:f.ForecastModel||'',
+    stockoutDays:+f.StockoutDays||0,
+    daysLeft:(f.DaysLeft===undefined||f.DaysLeft===null)?null:+f.DaysLeft
+  }));
+  return poLogRows;
+}
+
+function groupPOLogRuns(rows){
+  const m=new Map();
+  rows.forEach(r=>{
+    if(!m.has(r.runId)) m.set(r.runId,{runId:r.runId, runDate:r.runDate, by:r.by, lines:[]});
+    m.get(r.runId).lines.push(r);
+  });
+  return [...m.values()].map(run=>({
+    ...run,
+    overrides: run.lines.filter(l=>l.overridden).length,
+    units: run.lines.reduce((a,l)=>a+l.finalQty,0),
+    value: run.lines.reduce((a,l)=>a+l.finalQty*l.cost,0)
+  })).sort((a,b)=>String(b.runDate).localeCompare(String(a.runDate)));
+}
+
+async function renderPOLogPage(force){
+  const tb=document.getElementById('polog-runs');
+  tb.innerHTML='<tr><td colspan="8" class="text-muted" style="padding:20px;text-align:center">Loading PO log...</td></tr>';
+  document.getElementById('polog-detail').innerHTML='';
+  let rows;
+  try{
+    rows=await loadPOLog(force);
+  }catch(e){
+    const missing=/not found/i.test(e.message||'');
+    tb.innerHTML=`<tr><td colspan="8" style="padding:22px;text-align:center" class="text-muted">${missing
+      ? 'No PO log yet. Set it up from the <a href="#" onclick="showPage(\'import\');return false">Import Data</a> tab, then your next PO Export will be recorded.'
+      : 'Could not load the PO log: '+e.message}</td></tr>`;
+    return;
+  }
+  const runs=groupPOLogRuns(rows);
+  document.getElementById('polog-summary').textContent = runs.length
+    ? `${runs.length} PO run${runs.length===1?'':'s'} logged, ${rows.length.toLocaleString()} lines.`
+    : 'Every PO Export is recorded here with the forecast state behind it.';
+  if(!runs.length){
+    tb.innerHTML='<tr><td colspan="8" class="text-muted" style="padding:22px;text-align:center">No PO runs logged yet. Your next PO Export will appear here.</td></tr>';
+    return;
+  }
+  tb.innerHTML=runs.map(r=>`<tr style="cursor:pointer${r.runId===poLogSelectedRun?';background:var(--brand-light)':''}" onclick="showPOLogRun('${r.runId}')">
+    <td>${r.runDate?new Date(r.runDate).toLocaleString():'--'}</td>
+    <td style="font-family:ui-monospace,Menlo,monospace;font-size:12px">${r.runId}</td>
+    <td>${r.by||'--'}</td>
+    <td>${r.lines.length}</td>
+    <td>${r.overrides?`<span class="badge badge-warn">${r.overrides}</span>`:'<span class="text-muted">0</span>'}</td>
+    <td style="font-variant-numeric:tabular-nums">${r.units.toLocaleString()}</td>
+    <td style="font-variant-numeric:tabular-nums">$${r.value.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</td>
+    <td><button class="btn-sm">View</button></td>
+  </tr>`).join('');
+  if(poLogSelectedRun && runs.some(r=>r.runId===poLogSelectedRun)) showPOLogRun(poLogSelectedRun);
+}
+
+function showPOLogRun(runId){
+  poLogSelectedRun=runId;
+  const run=groupPOLogRuns(poLogRows||[]).find(r=>r.runId===runId);
+  const el=document.getElementById('polog-detail');
+  if(!run){ el.innerHTML=''; return; }
+  // Overrides first, then largest orders: the lines most worth reviewing.
+  const lines=[...run.lines].sort((a,b)=>(b.overridden-a.overridden)||(b.finalQty-a.finalQty));
+  const num=v=>v===null||v===undefined?'<span class="text-muted">--</span>':Number(v).toLocaleString();
+  el.innerHTML=`<div class="card" style="margin-top:16px">
+    <div class="card-header">
+      <span class="card-title">${run.runId} &middot; ${run.runDate?new Date(run.runDate).toLocaleString():''}${run.by?' &middot; '+run.by:''}</span>
+      <span class="text-muted" style="font-size:12px">${run.lines.length} lines &middot; ${run.overrides} overridden</span>
+    </div>
+    <div class="table-wrap"><table><thead><tr>
+      <th>SKU</th><th>Forecast</th><th>Final</th><th>Change</th><th>Avg daily</th><th>2wk sales</th><th>On hand</th><th>On order</th><th>Days left</th><th>Model</th>
+    </tr></thead><tbody>${lines.map(l=>{
+      const diff=l.finalQty-l.forecastQty;
+      return `<tr${l.overridden?' style="background:var(--warn-light)"':''}>
+        <td><span class="sku-code">${l.sku}</span></td>
+        <td style="font-variant-numeric:tabular-nums">${num(l.forecastQty)}</td>
+        <td style="font-variant-numeric:tabular-nums;font-weight:700">${num(l.finalQty)}</td>
+        <td style="font-variant-numeric:tabular-nums;font-weight:600;color:${diff>0?'var(--ok)':diff<0?'var(--danger)':'var(--text-3)'}">${l.overridden?(diff>0?'+':diff<0?'\u2212':'')+Math.abs(diff).toLocaleString():'--'}</td>
+        <td style="font-variant-numeric:tabular-nums">${l.avgDaily}</td>
+        <td style="font-variant-numeric:tabular-nums">${num(l.sales14)}</td>
+        <td style="font-variant-numeric:tabular-nums">${num(l.onHand)}</td>
+        <td style="font-variant-numeric:tabular-nums">${num(l.onOrder)}</td>
+        <td style="font-variant-numeric:tabular-nums">${num(l.daysLeft)}</td>
+        <td style="font-size:11.5px" class="text-muted">${l.model}</td>
+      </tr>`;}).join('')}</tbody></table></div>
+  </div>`;
+  // re-mark the selected run row
+  document.querySelectorAll('#polog-runs tr').forEach(tr=>{
+    tr.style.background = tr.getAttribute('onclick')===`showPOLogRun('${runId}')` ? 'var(--brand-light)' : '';
+  });
+}
+
+async function exportPOLog(){
+  let rows;
+  try{ rows=await loadPOLog(false); }
+  catch(e){ return showToast('Could not load the PO log: '+e.message,'err'); }
+  if(!rows.length) return showToast('The PO log is empty','err');
+  const sorted=[...rows].sort((a,b)=>String(b.runDate).localeCompare(String(a.runDate))||a.sku.localeCompare(b.sku));
+  const out=[['Run ID','Run Date','Exported By','SKU','Forecast Qty','Override Qty','Final Qty','Overridden','Change','Unit Cost','Line Value ($)','Avg Daily','2wk Sales','On Hand','On Order','Lead Time','Reorder Cycle','Buffer Stock','Min Shelf','Model','Stockout Days','Days Left']];
+  sorted.forEach(r=>out.push([
+    r.runId, r.runDate?new Date(r.runDate).toLocaleString():'', r.by, r.sku,
+    r.forecastQty, r.overrideQty===null?'':r.overrideQty, r.finalQty, r.overridden?'Yes':'No',
+    r.finalQty-r.forecastQty, r.cost, Math.round(r.finalQty*r.cost*100)/100,
+    r.avgDaily, r.sales14, r.onHand, r.onOrder, r.lead, r.cycle, r.buffer, r.minShelf,
+    r.model, r.stockoutDays, r.daysLeft===null?'':r.daysLeft
+  ]));
+  const ws=XLSX.utils.aoa_to_sheet(out);
+  ws['!cols']=[{wch:20},{wch:20},{wch:18},{wch:18},{wch:12},{wch:12},{wch:10},{wch:11},{wch:9},{wch:10},{wch:13},{wch:10},{wch:10},{wch:9},{wch:9},{wch:10},{wch:13},{wch:12},{wch:10},{wch:20},{wch:13},{wch:10}];
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'PO Log');
+  XLSX.writeFile(wb,'PO_Log_'+new Date().toISOString().substring(0,10)+'.xlsx');
+  showToast('PO log exported','ok');
+}
+
+// ------------------------------------------------------------
 // OVERRIDE DRAFT
 // Overrides deliberately do not live in SharePoint -- a forgotten one would
 // silently distort a future PO. But losing an afternoon's work to a stray
@@ -1978,11 +2321,17 @@ function exportPO(){
   XLSX.utils.book_append_sheet(wb,ws,'Sheet1');
   XLSX.writeFile(wb,'SellerCloud_PO_'+new Date().toISOString().substring(0,10)+'.xlsx');
 
+  // The file is out. Capture the log snapshot now, synchronously, then write it
+  // in the background -- a slow or failed log must never cost a PO.
+  const logSnapshot=buildPOLogRows();
+
   discardPODraft();
   const notes=[];
   if(overridden) notes.push(overridden+' overridden');
   if(noCost) notes.push(noCost+' with no unit cost');
   showToast(items.length+' lines exported'+(notes.length?' -- '+notes.join(', '):' for SellerCloud'), noCost?'warn':'ok');
+
+  logPORun(logSnapshot);
 }
 
 // ============================================================
@@ -1992,10 +2341,12 @@ function showPage(id){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
   document.getElementById('page-'+id).classList.add('active');
-  const pages=['login','dashboard','forecast','import','orders','skus'];
+  const pages=['login','dashboard','forecast','import','orders','skus','polog'];
   const idx=pages.indexOf(id);
   if(idx>0) document.querySelectorAll('.nav-tab')[idx-1]?.classList.add('active');
   if(id==='orders'){ordersPage=0;renderOrdersTable();}
+  if(id==='polog'){renderPOLogPage(false);}
+  if(id==='import'){refreshPOLogSetup();}
 }
 function showProgress(type,pct,text){
   document.getElementById(type+'-progress').classList.remove('hidden');
