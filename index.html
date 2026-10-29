@@ -699,28 +699,58 @@ async function loadOrders() {
 // ============================================================
 
 // Build monthly demand rates from order records
+// Date helpers. Order dates are plain YYYY-MM-DD strings, so window maths is
+// done on those strings in UTC rather than on local Date objects -- mixing the
+// two is how a day can slip off either end of a window in Florida's timezone.
+function ymd(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+function utcDay(s){ const p=s.split('-'); return Date.UTC(+p[0], +p[1]-1, +p[2]); }
+function dayCount(a,b){ return Math.round((utcDay(b)-utcDay(a))/86400000)+1; } // inclusive
+
+// Monthly sales for one SKU across the observation window [startStr, endStr].
+// Each month carries:
+//   days   -- how many of its days fall inside the window
+//   rate   -- qty / days, i.e. a true daily rate even for a partial month
+//   weight -- days / days-in-month, how much of the month was observed
+// The previous version divided every month by its full calendar length, so a
+// partial month (the one in progress, or the first one in the window) always
+// read low. Full months are unaffected: days = days-in-month, weight = 1.
 function buildMonthlyRates(skuOrds, cutoff, now) {
-  const daily = {};
-  skuOrds.forEach(o => {
-    const net = Math.max(0, o.qtySold - o.qtyReturned);
-    if (net > 0) daily[o.date] = (daily[o.date] || 0) + net;
-  });
+  const startStr = cutoff.toISOString().substring(0,10);
+  const endStr = ymd(now);
   const monthly = {};
-  Object.entries(daily).forEach(([date, qty]) => {
-    const m = date.substring(0, 7);
-    if (!monthly[m]) monthly[m] = { qty: 0, activeDays: 0 };
-    monthly[m].qty += qty;
-    monthly[m].activeDays++;
+  skuOrds.forEach(o => {
+    if (!o.date || o.date < startStr || o.date > endStr) return;
+    const net = Math.max(0, o.qtySold - o.qtyReturned);
+    if (net <= 0) return;
+    const m = o.date.substring(0, 7);
+    if (!monthly[m]) monthly[m] = { qty: 0, activeDays: 0, _d: {} };
+    monthly[m].qty += net;
+    if (!monthly[m]._d[o.date]) { monthly[m]._d[o.date] = 1; monthly[m].activeDays++; }
   });
-  // Fill in months with zero sales (important for trend/smoothing)
-  let d = new Date(cutoff);
-  d.setDate(1);
-  while (d <= now) {
-    const key = d.toISOString().substring(0, 7);
+  // Every month in the window gets an entry, including zero-sale months.
+  let y = +startStr.substring(0,4), mo = +startStr.substring(5,7);
+  const endKey = endStr.substring(0,7);
+  for (let guard = 0; guard < 600; guard++) {
+    const key = y + '-' + String(mo).padStart(2,'0');
     if (!monthly[key]) monthly[key] = { qty: 0, activeDays: 0 };
-    d.setMonth(d.getMonth() + 1);
+    const dim = new Date(y, mo, 0).getDate();
+    const mStart = key + '-01', mEnd = key + '-' + String(dim).padStart(2,'0');
+    const a = mStart > startStr ? mStart : startStr;
+    const b = mEnd < endStr ? mEnd : endStr;
+    const days = b >= a ? dayCount(a, b) : 0;
+    monthly[key].days = days;
+    monthly[key].weight = days / dim;
+    monthly[key].rate = days > 0 ? monthly[key].qty / days : 0;
+    delete monthly[key]._d;
+    if (key === endKey) break;
+    if (++mo > 12) { mo = 1; y++; }
   }
   return monthly;
+}
+
+// Months in date order with their rate and observation weight.
+function monthSeries(monthly){
+  return Object.keys(monthly).sort().map(k => ({ key:k, rate:monthly[k].rate, w:monthly[k].weight }));
 }
 
 // ============================================================
@@ -813,96 +843,110 @@ function detectAndFilterStockouts(skuOrds, cutoff, now) {
   return filtered;
 }
 
-// Moving average: flat average over lookback period (best for stable SKUs)
+// Moving average: flat average over the observation window (stable SKUs).
+// The window now starts at the SKU's first sale when it is younger than its
+// lookback, so a new SKU is no longer divided by months it did not exist.
 function modelMovingAverage(skuOrds, cutoff, now) {
   const stockoutDays = skuOrds._stockoutDays || 0;
-  const totalDays = Math.max(1, (now - cutoff) / 86400000 - stockoutDays);
+  const startStr = cutoff.toISOString().substring(0,10);
+  const totalDays = Math.max(1, dayCount(startStr, ymd(now)) - stockoutDays);
   const totalNet = skuOrds.reduce((s, o) => s + Math.max(0, o.qtySold - o.qtyReturned), 0);
   return totalNet / totalDays;
 }
 
-// Exponential smoothing: monthly rates smoothed forward with alpha=0.4
-// Higher alpha = more weight on recent months (best for seasonal SKUs)
+// Exponential smoothing, alpha=0.4 (seasonal SKUs). A partial month's pull is
+// scaled by how much of it has been observed: on the 1st it barely moves the
+// estimate, by month end it carries the full alpha. Full months: unchanged.
 function modelExpSmoothing(skuOrds, cutoff, now, alpha=0.4) {
-  const monthly = buildMonthlyRates(skuOrds, cutoff, now);
-  const months = Object.keys(monthly).sort();
-  if (!months.length) return 0;
-  // Calculate daily rate per month (qty / days in month)
-  const rates = months.map(m => {
-    const daysInMonth = new Date(parseInt(m.substring(0,4)), parseInt(m.substring(5,7)), 0).getDate();
-    return monthly[m].qty / daysInMonth;
-  });
-  // Exponential smoothing forward through time
-  let smoothed = rates[0];
-  for (let i = 1; i < rates.length; i++) {
-    smoothed = alpha * rates[i] + (1 - alpha) * smoothed;
+  const series = monthSeries(buildMonthlyRates(skuOrds, cutoff, now));
+  if (!series.length) return 0;
+  let smoothed = series[0].rate;
+  for (let i = 1; i < series.length; i++) {
+    const a = alpha * series[i].w;
+    smoothed = a * series[i].rate + (1 - a) * smoothed;
   }
   return smoothed;
 }
 
-// Linear trend: fits a line through monthly rates and projects forward
-// Best for consistently growing or declining SKUs
+// Linear trend (trending SKUs): weighted least squares through monthly rates,
+// projected one month ahead. With every weight at 1 this is exactly the
+// ordinary least-squares fit used before; partial months simply count less.
 function modelLinearTrend(skuOrds, cutoff, now) {
-  const monthly = buildMonthlyRates(skuOrds, cutoff, now);
-  const months = Object.keys(monthly).sort();
-  if (months.length < 3) return modelMovingAverage(skuOrds, cutoff, now);
-  const rates = months.map((m, i) => {
-    const daysInMonth = new Date(parseInt(m.substring(0,4)), parseInt(m.substring(5,7)), 0).getDate();
-    return { x: i, y: monthly[m].qty / daysInMonth };
-  });
-  const n = rates.length;
-  const sumX = rates.reduce((s, r) => s + r.x, 0);
-  const sumY = rates.reduce((s, r) => s + r.y, 0);
-  const sumXY = rates.reduce((s, r) => s + r.x * r.y, 0);
-  const sumX2 = rates.reduce((s, r) => s + r.x * r.x, 0);
-  const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
-  const intercept = (sumY - slope * sumX) / n;
-  // Project one month ahead
-  const projected = intercept + slope * n;
-  return Math.max(0, projected);
+  const series = monthSeries(buildMonthlyRates(skuOrds, cutoff, now));
+  if (series.length < 3) return modelMovingAverage(skuOrds, cutoff, now);
+  let W=0, Sx=0, Sy=0, Sxx=0, Sxy=0;
+  series.forEach((p, x) => { W+=p.w; Sx+=p.w*x; Sy+=p.w*p.rate; Sxx+=p.w*x*x; Sxy+=p.w*x*p.rate; });
+  const den = W*Sxx - Sx*Sx;
+  if (!den || !W) return modelMovingAverage(skuOrds, cutoff, now);
+  const slope = (W*Sxy - Sx*Sy) / den;
+  const intercept = (Sy - slope*Sx) / W;
+  return Math.max(0, intercept + slope*series.length);
 }
 
-// Auto model: picks best model based on SKU volatility and trend
+// Classifies a SKU for Auto. Shared by modelAuto and the label in calcForecast
+// so the label can never disagree with the model actually used -- previously
+// a SKU with 3-5 months of history could be labelled Trend or Seasonal while
+// actually being forecast with a moving average.
+function classifyAuto(series){
+  if (series.length < 6) return 'Short';
+  const W = series.reduce((a,p)=>a+p.w, 0);
+  if (!W) return 'Zero';
+  const mean = series.reduce((a,p)=>a+p.w*p.rate, 0) / W;
+  if (mean <= 0) return 'Zero';
+  const cv = Math.sqrt(series.reduce((a,p)=>a+p.w*Math.pow(p.rate-mean,2), 0) / W) / mean;
+  const third = Math.floor(series.length / 3);
+  const wavg = arr => { const w=arr.reduce((a,p)=>a+p.w,0); return w>0 ? arr.reduce((a,p)=>a+p.w*p.rate,0)/w : 0; };
+  const early = wavg(series.slice(0, third)), late = wavg(series.slice(-third));
+  const trendRatio = early > 0 ? late / early : 1;
+  if (Math.abs(trendRatio - 1) > 0.3) return 'Trend';
+  if (cv > 0.3) return 'Seasonal';
+  return 'Stable';
+}
+
 function modelAuto(skuOrds, cutoff, now) {
-  const monthly = buildMonthlyRates(skuOrds, cutoff, now);
-  const months = Object.keys(monthly).sort();
-  if (months.length < 6) return modelMovingAverage(skuOrds, cutoff, now);
-
-  const rates = months.map(m => {
-    const daysInMonth = new Date(parseInt(m.substring(0,4)), parseInt(m.substring(5,7)), 0).getDate();
-    return monthly[m].qty / daysInMonth;
-  });
-
-  // Calculate coefficient of variation (CV) -- measure of seasonality/volatility
-  const mean = rates.reduce((a,b)=>a+b,0)/rates.length;
-  if (mean === 0) return 0;
-  const stdDev = Math.sqrt(rates.reduce((s,v)=>s+Math.pow(v-mean,2),0)/rates.length);
-  const cv = stdDev / mean;
-
-  // Check for trend: compare first third vs last third
-  const third = Math.floor(rates.length / 3);
-  const earlyAvg = rates.slice(0, third).reduce((a,b)=>a+b,0) / third;
-  const lateAvg = rates.slice(-third).reduce((a,b)=>a+b,0) / third;
-  const trendRatio = earlyAvg > 0 ? lateAvg / earlyAvg : 1;
-
-  // Strong trend (>30% change): use linear trend
-  if (Math.abs(trendRatio - 1) > 0.3) return modelLinearTrend(skuOrds, cutoff, now);
-  // High seasonality (CV > 0.3): use exponential smoothing
-  if (cv > 0.3) return modelExpSmoothing(skuOrds, cutoff, now, 0.4);
-  // Stable: use moving average
-  return modelMovingAverage(skuOrds, cutoff, now);
+  const kind = classifyAuto(monthSeries(buildMonthlyRates(skuOrds, cutoff, now)));
+  if (kind === 'Zero') return 0;
+  if (kind === 'Trend') return modelLinearTrend(skuOrds, cutoff, now);
+  if (kind === 'Seasonal') return modelExpSmoothing(skuOrds, cutoff, now, 0.4);
+  return modelMovingAverage(skuOrds, cutoff, now);   // Stable, or Short history
 }
 
 function calcForecast(sku) {
   const now = new Date();
-  const cutoff = new Date(now); cutoff.setMonth(cutoff.getMonth() - sku.lookback);
-  const skuOrds = orders.filter(o =>
-    o.sku === sku.code && !o.excluded && o.channel !== 'Wholesale' && new Date(o.date) >= cutoff
+  const endStr = ymd(now);
+  const lb = new Date(now); lb.setMonth(lb.getMonth() - sku.lookback);
+  const lookbackStartStr = ymd(lb);
+
+  const baseOrds = orders.filter(o =>
+    o.sku === sku.code && !o.excluded && o.channel !== 'Wholesale' &&
+    o.date && o.date >= lookbackStartStr && o.date <= endStr
   );
+
+  // A SKU younger than its lookback is measured from its first sale rather
+  // than divided by months before it existed. "Younger" is judged by the gap
+  // before its first order relative to how often it normally sells, so an
+  // established slow mover that happened not to sell early in the window is
+  // not mistaken for a new product.
+  let startStr = lookbackStartStr, newSku = false;
+  const first = firstSeenBySku.get(sku.code);
+  if (first && first > lookbackStartStr) {
+    const activeDays = new Set(baseOrds.filter(o => o.date >= first).map(o => o.date)).size;
+    const meanGap = dayCount(first, endStr) / Math.max(1, activeDays);
+    const initialGap = dayCount(lookbackStartStr, first) - 1;
+    if (initialGap > Math.max(30, 3 * meanGap)) { startStr = first; newSku = true; }
+  }
+  // Never measure velocity over less than four weeks of history.
+  const floorStr = ymd(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 27));
+  if (startStr > floorStr) startStr = floorStr;
+
+  // UTC midnight of startStr, so cutoff.toISOString() round-trips exactly.
+  const cutoff = new Date(startStr);
+  const skuOrds = startStr === lookbackStartStr ? baseOrds : baseOrds.filter(o => o.date >= startStr);
 
   if (!skuOrds.length) return {
     avgDaily:0, forecastDemand:0, bufferStock:0, reorderPoint:Math.max(sku.minShelf,0),
-    reorderPeriodDemand:0, orderQty:0, daysLeft:999, status:'ok', leadDemand:0, modelUsed:'No data'
+    reorderPeriodDemand:0, orderQty:0, daysLeft:999, status:'ok', leadDemand:0, modelUsed:'No data',
+    windowStart:startStr, newSku
   };
 
   // Run stockout detection and filter affected days from fast-moving SKUs
@@ -922,31 +966,13 @@ function calcForecast(sku) {
     case 'Linear Trend':
       avgDaily = modelLinearTrend(filteredOrds, cutoff, now);
       break;
-    default: // Auto
+    default: { // Auto
       avgDaily = modelAuto(filteredOrds, cutoff, now);
-      // Report which sub-model Auto selected
-      const monthly = buildMonthlyRates(filteredOrds, cutoff, now);
-      const months = Object.keys(monthly).sort();
-      const rates = months.map(m => {
-        const dim = new Date(parseInt(m.substring(0,4)), parseInt(m.substring(5,7)), 0).getDate();
-        return monthly[m].qty / dim;
-      });
-      const mean = rates.reduce((a,b)=>a+b,0)/Math.max(1,rates.length);
-      if (mean > 0) {
-        const stdDev = Math.sqrt(rates.reduce((s,v)=>s+Math.pow(v-mean,2),0)/rates.length);
-        const cv = stdDev/mean;
-        const third = Math.floor(rates.length/3);
-        if (third > 0) {
-          const earlyAvg = rates.slice(0,third).reduce((a,b)=>a+b,0)/third;
-          const lateAvg = rates.slice(-third).reduce((a,b)=>a+b,0)/third;
-          const tr = earlyAvg > 0 ? lateAvg/earlyAvg : 1;
-          if (Math.abs(tr-1) > 0.3) modelUsed = 'Auto (Trend)';
-          else if (cv > 0.3) modelUsed = 'Auto (Seasonal)';
-          else modelUsed = 'Auto (Stable)';
-        }
-      }
+      const kind = classifyAuto(monthSeries(buildMonthlyRates(filteredOrds, cutoff, now)));
+      modelUsed = kind === 'Zero' ? 'Auto' : kind === 'Short' ? 'Auto (Short history)' : 'Auto (' + kind + ')';
       if (stockoutDaysDetected > 0) modelUsed += ' +SO';
       break;
+    }
   }
 
   // Add stockout indicator to model label for non-Auto models
@@ -986,7 +1012,8 @@ function calcForecast(sku) {
   else if (sku.soh <= reorderPoint || daysLeft <= (sku.lead + sku.freq)) status = 'warn';
 
   return { avgDaily:Math.round(avgDaily*100)/100, forecastDemand, bufferStock, reorderPoint,
-    reorderPeriodDemand, orderQty, daysLeft, status, leadDemand, modelUsed, stockoutDaysDetected };
+    reorderPeriodDemand, orderQty, daysLeft, status, leadDemand, modelUsed, stockoutDaysDetected,
+    windowStart:startStr, newSku };
 }
 // Net units sold per SKU over the trailing 14 days. Built in a single pass
 // over `orders` rather than re-scanning inside calcForecast for each SKU.
@@ -1005,7 +1032,22 @@ function buildRecentSales(days){
   return m;
 }
 
+// Earliest order date per SKU across everything loaded, any channel. Used as
+// evidence of when a SKU started selling, so a new one is not measured
+// against months before it existed.
+let firstSeenBySku = new Map();
+function buildFirstSeen(){
+  const m=new Map();
+  for(const o of orders){
+    if(!o.date||!o.sku) continue;
+    const f=m.get(o.sku);
+    if(!f||o.date<f) m.set(o.sku,o.date);
+  }
+  return m;
+}
+
 function recalcAll(){
+  firstSeenBySku=buildFirstSeen();
   const recent=buildRecentSales(14);
   forecast=skus.map(s=>({sku:s,last14:recent.get(s.code)||0,...calcForecast(s)}));
   // Populate series dropdown
@@ -1733,6 +1775,7 @@ function histCalcPanel(f){
         <span><strong style="color:var(--text)">${s.soh.toLocaleString()}</strong> on hand</span>
         <span><strong style="color:var(--text)">${f.daysLeft>=999?'--':f.daysLeft}</strong> days left</span>
       </div>
+      ${f.newSku?`<div class="alert alert-info" style="margin:4px 0 10px">New SKU &mdash; velocity is measured from its first sale on <strong>${new Date(f.windowStart+'T12:00:00').toLocaleDateString()}</strong>, not across the full ${s.lookback}-month lookback, so months before it existed do not dilute the average.</div>`:''}
       <table style="width:100%;font-size:13px;border-collapse:collapse">${body}</table>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;padding-top:11px;border-top:2px solid var(--text)">
         <span style="font-weight:700;font-size:14px">Order quantity</span>
